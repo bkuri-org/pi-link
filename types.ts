@@ -54,6 +54,13 @@ export interface LinkRecoveryData {
 	savedAt: number;
 }
 
+export interface LinkActivity {
+	type: "sending" | "receiving" | "streaming" | "received" | "error";
+	label: string;
+	taskId?: string;
+	startedAt: number;
+}
+
 export interface LinkState {
 	mode: "none" | "host" | "guest";
 	transport: "uds" | "http";
@@ -74,6 +81,8 @@ export interface LinkState {
 	httpPort?: number;
 	httpRemoteUrl?: string;
 	httpSecret?: string;
+	activity: LinkActivity | null;
+	activityLog: LinkActivity[];
 }
 
 export function createInitialState(): LinkState {
@@ -97,6 +106,8 @@ export function createInitialState(): LinkState {
 		lastPeerActivity: 0,
 		pendingTask: undefined,
 		recovering: false,
+		activity: null,
+		activityLog: [],
 	};
 }
 

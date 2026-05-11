@@ -62,6 +62,7 @@ import {
 	ensureLinkSecret,
 	httpPostRpc,
 } from "./types.js";
+import type { LinkActivity, LinkState } from "./types.js";
 import { buildContextSnapshot, runSilentTask } from "./headless.js";
 
 const LINK_VERSION = "v0.2.0";
@@ -113,6 +114,79 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// ─── Activity Tracking ─────────────────────────────────────────────
+
+	const ACTIVITY_ICONS: Record<string, string> = {
+		sending: "📤",
+		receiving: "⏳",
+		streaming: "📡",
+		received: "📥",
+		error: "❌",
+	};
+
+	const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+	let spinnerFrame = 0;
+	let spinnerTimer: ReturnType<typeof setInterval> | undefined;
+
+	function setActivity(link: LinkState, type: LinkActivity["type"], label: string, taskId?: string): void {
+		link.activity = { type, label, taskId, startedAt: Date.now() };
+		link.activityLog.push(link.activity);
+		// Keep only last 10 log entries
+		if (link.activityLog.length > 10) link.activityLog = link.activityLog.slice(-10);
+		startSpinner();
+		updateWidget();
+	}
+
+	function clearActivity(link: LinkState): void {
+		link.activity = null;
+		// Check if any link still has activity
+		const anyActive = [...linksRegistry.values()].some(l => l.activity !== null);
+		if (!anyActive) stopSpinner();
+		updateWidget();
+	}
+
+	function startSpinner(): void {
+		if (spinnerTimer) return;
+		spinnerTimer = setInterval(() => {
+			spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
+			updateWidget();
+		}, 150);
+	}
+
+	function stopSpinner(): void {
+		if (spinnerTimer) {
+			clearInterval(spinnerTimer);
+			spinnerTimer = undefined;
+			spinnerFrame = 0;
+			updateWidget();
+		}
+	}
+
+	function formatActivity(link: LinkState, compact = false): string {
+		const a = link.activity;
+		if (!a) return "";
+		const icon = ACTIVITY_ICONS[a.type] ?? "•";
+		const elapsed = Math.round((Date.now() - a.startedAt) / 1000);
+		const timeStr = elapsed < 5 ? "just now" : elapsed < 60 ? `${elapsed}s` : `${Math.round(elapsed / 60)}m${elapsed % 60}s`;
+		if (compact) {
+			const spinner = (a.type === "sending" || a.type === "receiving" || a.type === "streaming")
+				? ` ${SPINNER_FRAMES[spinnerFrame]}` : "";
+			return `${icon}${spinner}`;
+		}
+		const taskInfo = a.taskId ? ` [${a.taskId.slice(0, 6)}]` : "";
+		return `${icon} ${a.label}${taskInfo} (${timeStr})`;
+	}
+
+	function formatActivityLog(link: LinkState): string[] {
+		if (link.activityLog.length === 0) return [];
+		const recent = link.activityLog.slice(-5);
+		return recent.map(a => {
+			const icon = ACTIVITY_ICONS[a.type] ?? "•";
+			const taskInfo = a.taskId ? ` [${a.taskId.slice(0, 6)}]` : "";
+			return `  ${icon} ${a.label}${taskInfo}`;
+		});
+	}
+
 	// ─── Widget ────────────────────────────────────────────────────────────
 
 	function updateWidget(): void {
@@ -157,40 +231,52 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const lines: string[] = [];
+		const activityStr = formatActivity(link);
+
 		if (link.mode === "host") {
 			if (link.recovering) {
-				ctx!.ui.setWidget("link", [`🔗 Recovering link...`, `  ${link.meta.sessionName}`]);
+				lines.push(`🔗 Recovering link...`, `  ${link.meta.sessionName}`);
 				ctx!.ui.setStatus("link", "🔗 recovering...");
-				return;
-			}
-			if (link.isConnected) {
+			} else if (link.isConnected) {
 				const peer = link.peerInfo?.sessionName ?? "peer";
 				const transport = link.transport === "http" ? ` [HTTP :${link.httpPort}]` : "";
-				ctx!.ui.setWidget("link", [`🔗 Linked (host) → ${peer}`, `  ${link.meta.model}${transport}`]);
-				ctx!.ui.setStatus("link", `🔗 ${peer}`);
+				lines.push(`🔗 Linked (host) → ${peer}`, `  ${link.meta.model}${transport}`);
+				if (activityStr) lines.push(activityStr);
+				const log = formatActivityLog(link);
+				if (log.length > 0) {
+					lines.push("", "  Recent activity:");
+					lines.push(...log.slice(-3));
+				}
+				ctx!.ui.setStatus("link", `🔗 ${formatActivity(link, true) || peer}`);
 			} else {
 				const transport = link.transport === "http" ? ` [HTTP :${link.httpPort}]` : "";
-				ctx!.ui.setWidget("link", [`🔗 Waiting for peer...${transport}`, `  ${link.meta.sessionName}`, `  ${link.meta.model}`]);
+				lines.push(`🔗 Waiting for peer...${transport}`, `  ${link.meta.sessionName}`, `  ${link.meta.model}`);
 				ctx!.ui.setStatus("link", "🔗 waiting...");
 			}
-			return;
+		} else {
+			// guest
+			if (link.recovering) {
+				lines.push(`🔗 Recovering link...`, `  ${link.meta.sessionName}`);
+				ctx!.ui.setStatus("link", "🔗 recovering...");
+			} else if (link.isConnected) {
+				const peer = link.meta.sessionName || link.meta.id;
+				const transport = link.transport === "http" ? " [HTTP]" : "";
+				lines.push(`🔗 Linked (guest) → ${peer}${transport}`, `  ${link.peerInfo?.model ?? ""}`);
+				if (activityStr) lines.push(activityStr);
+				const log = formatActivityLog(link);
+				if (log.length > 0) {
+					lines.push("", "  Recent activity:");
+					lines.push(...log.slice(-3));
+				}
+				ctx!.ui.setStatus("link", `🔗 ${formatActivity(link, true) || peer}`);
+			} else {
+				ctx!.ui.setWidget("link", undefined);
+				ctx!.ui.setStatus("link", undefined);
+			}
 		}
 
-		// guest
-		if (link.recovering) {
-			ctx!.ui.setWidget("link", [`🔗 Recovering link...`, `  ${link.meta.sessionName}`]);
-			ctx!.ui.setStatus("link", "🔗 recovering...");
-			return;
-		}
-		if (link.isConnected) {
-			const peer = link.meta.sessionName || link.meta.id;
-			const transport = link.transport === "http" ? " [HTTP]" : "";
-			ctx!.ui.setWidget("link", [`🔗 Linked (guest) → ${peer}${transport}`, `  ${link.peerInfo?.model ?? ""}`]);
-			ctx!.ui.setStatus("link", `🔗 ${peer}`);
-		} else {
-			ctx!.ui.setWidget("link", undefined);
-			ctx!.ui.setStatus("link", undefined);
-		}
+		ctx!.ui.setWidget("link", lines.length > 0 ? lines : undefined);
 	}
 
 	// ─── Per-link message handling ─────────────────────────────────────────
@@ -303,6 +389,8 @@ export default function (pi: ExtensionAPI) {
 			const r = msg.result as { taskId?: string; status?: string; content?: string };
 			if (r.status === "completed" && r.content) {
 				ctx?.ui.notify(`📥 Result from peer (${r.taskId?.slice(0, 8)})`, "success");
+				setActivity(link, "received", `Result received (${r.taskId?.slice(0, 8)})`, r.taskId);
+				setTimeout(() => clearActivity(link), 3000);
 				pi.sendMessage({
 					customType: "link-result",
 					content: r.content,
@@ -321,6 +409,7 @@ export default function (pi: ExtensionAPI) {
 		const shouldReply = p.replyTo === "sender";
 		const shouldStream = p.stream === true && link.connection && !link.connection.destroyed;
 		ctx?.ui.notify(`📥 Silent task: ${p.prompt.slice(0, 60)}...${shouldStream ? " [streaming]" : ""}`, "info");
+		setActivity(link, shouldStream ? "streaming" : "receiving", `Processing: ${p.prompt.slice(0, 40)}...`, p.taskId);
 
 		const ourContext = ctx ? buildContextSnapshot(() => ctx!.sessionManager.getBranch()) : undefined;
 		let fullContext: string | undefined;
@@ -364,6 +453,8 @@ export default function (pi: ExtensionAPI) {
 					result: { taskId: p.taskId, status: "completed", content: result.output, error: result.error },
 				});
 				ctx?.ui.notify(`📤 Silent task result sent (${p.taskId.slice(0, 8)})`, "success");
+			setActivity(link, "received", `Result sent (${p.taskId.slice(0, 8)})`, p.taskId);
+			setTimeout(() => clearActivity(link), 3000);
 			}
 		}
 	}
@@ -379,6 +470,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		ctx?.ui.notify(`📥 Visible task: ${p.prompt.slice(0, 60)}...`, "info");
+		setActivity(link, "receiving", `Visible: ${p.prompt.slice(0, 40)}...`, p.taskId);
+		setTimeout(() => clearActivity(link), 5000);
 		pi.sendUserMessage(prompt, { deliverAs: "steer" });
 	}
 
@@ -984,8 +1077,9 @@ export default function (pi: ExtensionAPI) {
 			const conn = link.connection;
 			if (!conn || conn.destroyed) { c.ui.notify("Connection lost", "error"); cleanupLink(link); return; }
 
+			const taskId = generateId();
 			sendJsonRpc(conn, createJsonRpc("task/send", {
-				taskId: generateId(),
+				taskId,
 				prompt,
 				mode: isVisible ? "visible" : "silent",
 				replyTo: "sender",
@@ -993,6 +1087,7 @@ export default function (pi: ExtensionAPI) {
 
 			const badge = isVisible ? "👁 visible" : "🔇 silent";
 			c.ui.notify(`📤 Task sent (${badge}) to ${link.meta.sessionName}`, "info");
+			setActivity(link, "sending", `Sent: ${prompt.slice(0, 40)}...`, taskId);
 		},
 	});
 
@@ -1402,6 +1497,8 @@ export default function (pi: ExtensionAPI) {
 				replyTo: params.reply_to ?? "sender",
 				stream: params.stream === true,
 			}));
+
+			setActivity(link, "sending", `Sent: ${params.prompt.slice(0, 40)}...`, taskId);
 
 			const willReply = wantReply;
 			const isStreaming = params.stream === true;
