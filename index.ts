@@ -62,7 +62,7 @@ import {
 	ensureLinkSecret,
 	httpPostRpc,
 } from "./types.js";
-import type { LinkActivity, LinkState } from "./types.js";
+import type { LinkActivity } from "./types.js";
 import { buildContextSnapshot, runSilentTask } from "./headless.js";
 
 const LINK_VERSION = "v0.2.0";
