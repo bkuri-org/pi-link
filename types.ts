@@ -7,6 +7,7 @@ import * as crypto from "node:crypto";
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 export const LINKS_DIR = path.join(os.homedir(), ".pi", "links");
+export const LINK_RECOVERY_DIR = path.join(os.homedir(), ".pi", "link-recovery");
 export const STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const SOCKET_TIMEOUT_MS = 120_000;
@@ -40,6 +41,15 @@ export interface PendingTask {
 	receivedAt: number;
 }
 
+export interface LinkRecoveryData {
+	sessionId: string;
+	mode: "host" | "guest";
+	linkId: string;
+	meta: LinkMeta;
+	peerInfo?: { sessionId: string; sessionName?: string; model?: string };
+	savedAt: number;
+}
+
 export interface LinkState {
 	mode: "none" | "host" | "guest";
 	linkId: string;
@@ -54,6 +64,7 @@ export interface LinkState {
 	heartbeatTimer?: ReturnType<typeof setInterval>;
 	lastPeerActivity: number;
 	pendingTask?: PendingTask;
+	recovering: boolean;
 }
 
 export function createInitialState(): LinkState {
@@ -75,6 +86,7 @@ export function createInitialState(): LinkState {
 		isConnected: false,
 		lastPeerActivity: 0,
 		pendingTask: undefined,
+		recovering: false,
 	};
 }
 
@@ -148,6 +160,42 @@ export function cleanupLinkDir(dir: string): void {
 		const sock = path.join(dir, "link.sock");
 		if (fs.existsSync(sock)) fs.unlinkSync(sock);
 		fs.rmSync(dir, { recursive: true, force: true });
+	} catch {
+		// Best effort
+	}
+}
+
+// ─── Recovery helpers ─────────────────────────────────────────────────────
+
+export function getRecoveryFilePath(sessionId: string): string {
+	return path.join(LINK_RECOVERY_DIR, `${sessionId}.json`);
+}
+
+export function saveRecoveryData(sessionId: string, data: LinkRecoveryData): void {
+	try {
+		fs.mkdirSync(LINK_RECOVERY_DIR, { recursive: true });
+		fs.writeFileSync(
+			getRecoveryFilePath(sessionId),
+			JSON.stringify(data, null, 2),
+			{ encoding: "utf-8", mode: 0o600 },
+		);
+	} catch {
+		// Best effort — if we can't save, link won't survive reload
+	}
+}
+
+export function loadRecoveryData(sessionId: string): LinkRecoveryData | null {
+	try {
+		const raw = fs.readFileSync(getRecoveryFilePath(sessionId), "utf-8");
+		return JSON.parse(raw) as LinkRecoveryData;
+	} catch {
+		return null;
+	}
+}
+
+export function deleteRecoveryData(sessionId: string): void {
+	try {
+		fs.unlinkSync(getRecoveryFilePath(sessionId));
 	} catch {
 		// Best effort
 	}

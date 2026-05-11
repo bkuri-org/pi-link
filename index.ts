@@ -32,6 +32,7 @@ import {
 	type LinkMeta,
 	type JsonRpcMessage,
 	type LinkState,
+	type LinkRecoveryData,
 	createInitialState,
 	ensureLinksDir,
 	generateId,
@@ -42,6 +43,9 @@ import {
 	createJsonRpc,
 	sendJsonRpc,
 	parseJsonRpcLines,
+	saveRecoveryData,
+	loadRecoveryData,
+	deleteRecoveryData,
 } from "./types.js";
 import { buildContextSnapshot, runSilentTask } from "./headless.js";
 
@@ -63,6 +67,11 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (state.mode === "host") {
+			if (state.recovering) {
+				ctx.ui.setWidget("link", [`🔗 Recovering link...`, `  ${state.meta.sessionName}`]);
+				ctx.ui.setStatus("link", "🔗 recovering...");
+				return;
+			}
 			if (state.isConnected) {
 				const peer = state.peerInfo?.sessionName ?? "peer";
 				ctx.ui.setWidget("link", [`🔗 Linked (host) → ${peer}`, `  ${state.meta.model}`]);
@@ -75,6 +84,11 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// guest
+		if (state.recovering) {
+			ctx.ui.setWidget("link", [`🔗 Recovering link...`, `  ${state.meta.sessionName}`]);
+			ctx.ui.setStatus("link", "🔗 recovering...");
+			return;
+		}
 		if (state.isConnected) {
 			const peer = state.meta.sessionName || state.meta.id;
 			ctx.ui.setWidget("link", [`🔗 Linked (guest) → ${peer}`, `  ${state.peerInfo?.model ?? ""}`]);
@@ -260,8 +274,169 @@ export default function (pi: ExtensionAPI) {
 		if (state.mode === "host" && state.linkId) {
 			cleanupLinkDir(path.join(LINKS_DIR, state.linkId));
 		}
+		// Clear recovery data on clean disconnect
+		if (state.meta.sessionId) {
+			deleteRecoveryData(state.meta.sessionId);
+		}
 		state = createInitialState();
 		updateWidget();
+	}
+
+	// ─── Recovery ─────────────────────────────────────────────────────────
+
+	async function attemptRecovery(c: ExtensionContext): Promise<void> {
+		const recovery = loadRecoveryData(state.meta.sessionId);
+		if (!recovery) return;
+
+		// Don't try to recover if too old (stale)
+		if (Date.now() - recovery.savedAt > STALE_THRESHOLD_MS) {
+			deleteRecoveryData(state.meta.sessionId);
+			return;
+		}
+
+		// Only recover if we have a linkId
+		if (!recovery.linkId) {
+			deleteRecoveryData(state.meta.sessionId);
+			return;
+		}
+
+		state.recovering = true;
+		updateWidget();
+
+		if (recovery.mode === "host") {
+			await recoverAsHost(recovery, c);
+		} else if (recovery.mode === "guest") {
+			await recoverAsGuest(recovery, c);
+		}
+
+		// Clear recovery data regardless of success
+		deleteRecoveryData(state.meta.sessionId);
+		state.recovering = false;
+		updateWidget();
+	}
+
+	async function recoverAsHost(recovery: LinkRecoveryData, c: ExtensionContext): Promise<void> {
+		ensureLinksDir();
+		const linkDir = path.join(LINKS_DIR, recovery.linkId);
+		const sockPath = path.join(linkDir, "link.sock");
+
+		// Check if the link dir still exists (peer may have cleaned it up)
+		const existingMeta = readMeta(linkDir);
+
+		// Recreate the link directory and meta
+		fs.mkdirSync(linkDir, { recursive: true });
+		const meta: LinkMeta = {
+			...recovery.meta,
+			sessionId: state.meta.sessionId,
+			model: state.meta.model,
+			lastHeartbeat: Date.now(),
+			status: "waiting",
+		};
+		writeMeta(linkDir, meta);
+
+		// Create server
+		const server = net.createServer((socket) => {
+			state.connection = socket;
+			state.isConnected = true;
+			state.buffer = "";
+			state.lastPeerActivity = Date.now();
+			state.recovering = false;
+			state.meta.status = "connected";
+			writeMeta(linkDir, state.meta);
+
+			socket.on("data", handleData);
+			socket.on("close", () => {
+				stopHeartbeat();
+				state.isConnected = false;
+				state.connection = undefined;
+				state.meta.status = "waiting";
+				writeMeta(linkDir, state.meta);
+				c.ui.notify("🔗 Peer disconnected", "warning");
+				updateWidget();
+			});
+			socket.on("error", (err) => { console.error("Link socket error:", err.message); });
+
+			sendJsonRpc(socket, createJsonRpc("ping", { sessionId: meta.sessionId, sessionName: meta.sessionName }));
+			startHeartbeat();
+			c.ui.notify("🔗 Peer reconnected!", "success");
+			updateWidget();
+		});
+
+		try { if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath); } catch { /* ignore */ }
+
+		try {
+			await new Promise<void>((resolve, reject) => {
+				server.listen(sockPath, () => { fs.chmodSync(sockPath, 0o600); resolve(); });
+				server.on("error", reject);
+			});
+
+			state.mode = "host";
+			state.linkId = recovery.linkId;
+			state.socketPath = sockPath;
+			state.meta = meta;
+			state.server = server;
+			if (recovery.peerInfo) state.peerInfo = recovery.peerInfo;
+
+			c.ui.notify(`🔗 Link recovered (host): ${recovery.linkId}`, "success");
+		} catch (err: any) {
+			c.ui.notify(`🔗 Link recovery failed: ${err.message}`, "warning");
+		}
+	}
+
+	async function recoverAsGuest(recovery: LinkRecoveryData, c: ExtensionContext): Promise<void> {
+		const linkDir = path.join(LINKS_DIR, recovery.linkId);
+		const sockPath = path.join(linkDir, "link.sock");
+
+		// Check if the host's link dir still exists
+		const hostMeta = readMeta(linkDir);
+		if (!hostMeta) {
+			c.ui.notify("🔗 Link recovery failed: host link no longer exists", "warning");
+			return;
+		}
+
+		const socket = new net.Socket();
+		socket.setTimeout(SOCKET_TIMEOUT_MS);
+
+		socket.on("data", handleData);
+		socket.on("close", () => {
+			state.isConnected = false;
+			state.connection = undefined;
+			stopHeartbeat();
+			c.ui.notify("🔗 Link closed", "warning");
+			cleanup();
+		});
+		socket.on("error", (err) => {
+			console.error("Link error:", err.message);
+			c.ui.notify(`🔗 Reconnection failed: ${err.message}`, "warning");
+			state.mode = "none";
+			updateWidget();
+		});
+		socket.on("timeout", () => { c.ui.notify("🔗 Link timed out", "warning"); socket.destroy(); cleanup(); });
+
+		try {
+			await new Promise<void>((resolve, reject) => {
+				socket.connect(sockPath, () => resolve());
+				socket.on("error", reject);
+			});
+
+			state.mode = "guest";
+			state.linkId = recovery.linkId;
+			state.socketPath = sockPath;
+			state.meta = hostMeta;
+			state.connection = socket;
+			state.isConnected = true;
+			state.recovering = false;
+			state.buffer = "";
+			state.lastPeerActivity = Date.now();
+			if (recovery.peerInfo) state.peerInfo = recovery.peerInfo;
+
+			sendJsonRpc(socket, createJsonRpc("ping", { sessionId: state.meta.sessionId, sessionName: state.meta.sessionName }));
+			startHeartbeat();
+			c.ui.notify(`🔗 Link recovered (guest) → ${hostMeta.sessionName}`, "success");
+			updateWidget();
+		} catch (err: any) {
+			c.ui.notify(`🔗 Link recovery failed: ${err.message}`, "warning");
+		}
 	}
 
 	// ─── Events ────────────────────────────────────────────────────────────
@@ -275,15 +450,33 @@ export default function (pi: ExtensionAPI) {
 		return new Text(lines.join("\n"), 0, 0);
 	});
 
-	pi.on("session_start", async (_event, c) => {
+	pi.on("session_start", async (event, c) => {
 		ctx = c;
 		const sessionFile = c.sessionManager.getSessionFile();
 		state.meta.sessionId = sessionFile ?? crypto.randomUUID();
 		state.meta.sessionName = pi.getSessionName() ?? path.basename(sessionFile ?? "unnamed", ".jsonl");
 		state.meta.model = c.model ? `${c.model.provider}/${c.model.id}` : "unknown";
+
+		// Attempt to recover a link after reload
+		if ((event as any).reason === "reload") {
+			await attemptRecovery(c);
+		}
 	});
 
-	pi.on("session_shutdown", async () => { cleanup(); });
+	pi.on("session_shutdown", async (event) => {
+		// Persist link state for recovery on reload
+		if (state.mode !== "none" && state.meta.sessionId && (event as any).reason === "reload") {
+			saveRecoveryData(state.meta.sessionId, {
+				sessionId: state.meta.sessionId,
+				mode: state.mode as "host" | "guest",
+				linkId: state.linkId,
+				meta: state.meta,
+				peerInfo: state.peerInfo,
+				savedAt: Date.now(),
+			});
+		}
+		cleanup();
+	});
 
 	pi.on("agent_end", async (event, c) => {
 		if (!state.pendingTask || !state.isConnected) return;
@@ -487,6 +680,7 @@ export default function (pi: ExtensionAPI) {
 			`Session: ${state.meta.sessionName}`,
 			`Model: ${state.meta.model}`,
 		];
+		if (state.recovering) lines.push(`Status: recovering...`);
 		if (state.peerInfo?.sessionName) lines.push(`Peer: ${state.peerInfo.sessionName}`);
 		if (state.peerInfo?.model) lines.push(`Peer model: ${state.peerInfo.model}`);
 		c.ui.notify(lines.join("\n"), "info");
