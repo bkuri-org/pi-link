@@ -95,11 +95,17 @@ export function readMeta(linkDir: string): LinkMeta | null {
 }
 
 export function writeMeta(linkDir: string, meta: LinkMeta): void {
-	fs.writeFileSync(
-		path.join(linkDir, "meta.json"),
-		JSON.stringify(meta, null, 2),
-		{ encoding: "utf-8", mode: 0o600 },
-	);
+	try {
+		fs.mkdirSync(linkDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(linkDir, "meta.json"),
+			JSON.stringify(meta, null, 2),
+			{ encoding: "utf-8", mode: 0o600 },
+		);
+	} catch (err: any) {
+		if (err.code !== "ENOENT") throw err;
+		// Directory was cleaned up by the other side — ignore
+	}
 }
 
 export interface DiscoveredLink {
