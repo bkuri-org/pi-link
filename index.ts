@@ -11,12 +11,15 @@
  *   /link status             — show connection info
  *   /link disconnect         — close the link
  *   /link version            — show version + content hash
+ *   /link list               — show all available links
+ *   /link http://host:port   — connect to remote link via HTTP
  *   /link-task <prompt>      — send a silent task
  *   /link-task --visible <prompt> — send a visible task
  */
 
 import * as fs from "node:fs";
 import * as net from "node:net";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
@@ -29,6 +32,8 @@ import {
 	HEARTBEAT_INTERVAL_MS,
 	HEARTBEAT_TIMEOUT_MS,
 	SOCKET_TIMEOUT_MS,
+	HTTP_LINK_DEFAULT_PORT,
+	HTTP_TASK_TIMEOUT_MS,
 	type LinkMeta,
 	type JsonRpcMessage,
 	type LinkState,
@@ -46,6 +51,9 @@ import {
 	saveRecoveryData,
 	loadRecoveryData,
 	deleteRecoveryData,
+	getLinkSecret,
+	ensureLinkSecret,
+	httpPostRpc,
 } from "./types.js";
 import { buildContextSnapshot, runSilentTask } from "./headless.js";
 
@@ -84,10 +92,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (state.isConnected) {
 				const peer = state.peerInfo?.sessionName ?? "peer";
-				ctx.ui.setWidget("link", [`🔗 Linked (host) → ${peer}`, `  ${state.meta.model}`]);
+				const transport = state.transport === "http" ? ` [HTTP :${state.httpPort}]` : "";
+				ctx.ui.setWidget("link", [`🔗 Linked (host) → ${peer}`, `  ${state.meta.model}${transport}`]);
 				ctx.ui.setStatus("link", `🔗 ${peer}`);
 			} else {
-				ctx.ui.setWidget("link", [`🔗 Waiting for peer...`, `  ${state.meta.sessionName}`, `  ${state.meta.model}`]);
+				const transport = state.transport === "http" ? ` [HTTP :${state.httpPort}]` : "";
+				ctx.ui.setWidget("link", [`🔗 Waiting for peer...${transport}`, `  ${state.meta.sessionName}`, `  ${state.meta.model}`]);
 				ctx.ui.setStatus("link", "🔗 waiting...");
 			}
 			return;
@@ -101,7 +111,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (state.isConnected) {
 			const peer = state.meta.sessionName || state.meta.id;
-			ctx.ui.setWidget("link", [`🔗 Linked (guest) → ${peer}`, `  ${state.peerInfo?.model ?? ""}`]);
+			const transport = state.transport === "http" ? ` [HTTP]` : "";
+			ctx.ui.setWidget("link", [`🔗 Linked (guest) → ${peer}${transport}`, `  ${state.peerInfo?.model ?? ""}`]);
 			ctx.ui.setStatus("link", `🔗 ${peer}`);
 		} else {
 			ctx.ui.setWidget("link", undefined);
@@ -299,6 +310,11 @@ export default function (pi: ExtensionAPI) {
 		stopHeartbeat();
 		if (state.connection) { state.connection.destroy(); state.connection = undefined; }
 		if (state.server) { state.server.close(); state.server = undefined; }
+		if (state.httpServer) {
+			state.httpServer.close();
+			state.httpServer = undefined;
+			state.httpPort = undefined;
+		}
 		if (state.mode === "host" && state.linkId) {
 			cleanupLinkDir(path.join(LINKS_DIR, state.linkId));
 		}
@@ -308,6 +324,227 @@ export default function (pi: ExtensionAPI) {
 		}
 		state = createInitialState();
 		updateWidget();
+	}
+
+	// ─── HTTP Adapter ─────────────────────────────────────────────────────
+
+	function readBody(req: http.IncomingMessage): Promise<string> {
+		return new Promise((resolve, reject) => {
+			const chunks: Buffer[] = [];
+			req.on("data", (chunk: Buffer) => chunks.push(chunk));
+			req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+			req.on("error", reject);
+		});
+	}
+
+	function startHttpAdapter(port: number, secret: string): http.Server {
+		const server = http.createServer(async (req, res) => {
+			// CORS
+			res.setHeader("Access-Control-Allow-Origin", "*");
+			res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+			res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+			if (req.method === "OPTIONS") {
+				res.writeHead(204);
+				res.end();
+				return;
+			}
+
+			// Auth
+			const auth = req.headers["authorization"];
+			if (auth !== `Bearer ${secret}`) {
+				res.writeHead(401, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: 401, message: "Unauthorized" }, id: null }));
+				return;
+			}
+
+			// Discovery (A2A-compatible agent card)
+			if (req.url === "/.well-known/agent.json" && req.method === "GET") {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({
+					name: state.meta.sessionName,
+					url: `http://0.0.0.0:${port}`,
+					model: state.meta.model,
+					sessionId: state.meta.sessionId,
+					protocol: "pi-link",
+					version: LINK_VERSION,
+					skills: ["task/send", "ping", "version/get"],
+				}));
+				return;
+			}
+
+			// Health check
+			if (req.url === "/health" && req.method === "GET") {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ status: "ok", session: state.meta.sessionName, transport: "http" }));
+				return;
+			}
+
+			// RPC endpoint
+			if (req.url === "/rpc" && req.method === "POST") {
+				try {
+					const body = await readBody(req);
+					const msg = JSON.parse(body) as JsonRpcMessage;
+					const response = await handleHttpRpc(msg);
+					res.writeHead(200, { "Content-Type": "application/json" });
+					res.end(JSON.stringify(response));
+				} catch (err: any) {
+					res.writeHead(500, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: err.message }, id: null }));
+				}
+				return;
+			}
+
+			res.writeHead(404);
+			res.end("Not found");
+		});
+
+		server.listen(port, "0.0.0.0", () => {
+			ctx?.ui.notify(`🔗 HTTP adapter listening on port ${port}`, "info");
+		});
+
+		server.on("error", (err) => {
+			ctx?.ui.notify(`🔗 HTTP adapter error: ${err.message}`, "error");
+		});
+
+		return server;
+	}
+
+	async function handleHttpRpc(msg: JsonRpcMessage): Promise<JsonRpcMessage> {
+		// Ping
+		if (msg.method === "ping") {
+			return {
+				jsonrpc: "2.0",
+				id: msg.id,
+				result: {
+					sessionId: state.meta.sessionId,
+					sessionName: state.meta.sessionName,
+					model: state.meta.model,
+					hash: loadTimeHash,
+				},
+			};
+		}
+
+		// Version
+		if (msg.method === "version/get") {
+			return {
+				jsonrpc: "2.0",
+				id: msg.id,
+				result: { version: LINK_VERSION, hash: loadTimeHash, sessionName: state.meta.sessionName },
+			};
+		}
+
+		// Task send — synchronous for HTTP transport
+		if (msg.method === "task/send") {
+			const p = msg.params as { taskId: string; prompt: string; context?: string; replyTo?: string; mode?: string } | undefined;
+			if (!p?.prompt) {
+				return { jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Missing prompt parameter" } };
+			}
+
+			const mode = p.mode === "visible" ? "visible" as const : "silent" as const;
+			ctx?.ui.notify(`📥 HTTP task: ${p.prompt.slice(0, 60)}...`, "info");
+
+			if (mode === "silent") {
+				const ourContext = ctx ? buildContextSnapshot(() => ctx!.sessionManager.getBranch()) : undefined;
+				let fullContext: string | undefined;
+				if (p.context && ourContext) {
+					fullContext = `## Sender's context\n\n${p.context}\n\n## Our context\n\n${ourContext}`;
+				} else if (p.context) {
+					fullContext = p.context;
+				} else if (ourContext) {
+					fullContext = ourContext;
+				}
+
+				const result = await runSilentTask(p.prompt, fullContext, ctx?.cwd ?? process.cwd(), state.meta.model);
+				ctx?.ui.notify(`📤 HTTP task result sent (${p.taskId.slice(0, 8)})`, "success");
+				return {
+					jsonrpc: "2.0",
+					id: msg.id,
+					result: { taskId: p.taskId, status: "completed", content: result.output, error: result.error },
+				};
+			} else {
+				// Visible mode — inject into session, return ack
+				processVisibleTask(p);
+				return {
+					jsonrpc: "2.0",
+					id: msg.id,
+					result: { taskId: p.taskId, status: "received", mode: "visible", note: "Injected into session — result not returned over HTTP" },
+				};
+			}
+		}
+
+		return { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } };
+	}
+
+	async function connectHttpRemote(url: string, secret: string): Promise<void> {
+		// Discover remote session info
+		const agentUrl = url.replace(/\/$/, "") + "/.well-known/agent.json";
+		const agentInfo = await new Promise<any>((resolve, reject) => {
+			const r = http.request(agentUrl, {
+				method: "GET",
+				headers: { Authorization: `Bearer ${secret}` },
+				timeout: 10_000,
+			}, (res) => {
+				let data = "";
+				res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+				res.on("end", () => {
+					if (res.statusCode === 200) {
+						try { resolve(JSON.parse(data)); }
+						catch { reject(new Error("Invalid agent card")); }
+					} else {
+						reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+					}
+				});
+			});
+			r.on("error", reject);
+			r.on("timeout", () => { r.destroy(); reject(new Error("Discovery timed out")); });
+			r.end();
+		});
+
+		// Ping to verify connectivity
+		const pingResponse = await httpPostRpc(url, secret, createJsonRpc("ping", {
+			sessionId: state.meta.sessionId,
+			sessionName: state.meta.sessionName,
+		}));
+
+		state.mode = "guest";
+		state.transport = "http";
+		state.linkId = agentInfo.sessionId ?? generateId();
+		state.httpRemoteUrl = url;
+		state.httpSecret = secret;
+		state.isConnected = true;
+		state.lastPeerActivity = Date.now();
+		state.meta = {
+			id: state.linkId,
+			sessionId: agentInfo.sessionId ?? "",
+			sessionName: agentInfo.name ?? "remote",
+			model: agentInfo.model ?? "unknown",
+			created: Date.now(),
+			lastHeartbeat: Date.now(),
+			status: "connected",
+		};
+		state.peerInfo = {
+			sessionId: pingResponse.result?.sessionId as string ?? "",
+			sessionName: pingResponse.result?.sessionName as string ?? agentInfo.name,
+			model: pingResponse.result?.model as string ?? agentInfo.model,
+		};
+
+		// Start HTTP heartbeat (periodic ping to detect liveness)
+		state.heartbeatTimer = setInterval(async () => {
+			if (Date.now() - state.lastPeerActivity > HEARTBEAT_TIMEOUT_MS) {
+				handlePeerLost("HTTP heartbeat timeout");
+				return;
+			}
+			try {
+				await httpPostRpc(state.httpRemoteUrl!, state.httpSecret!, createJsonRpc("ping", {
+					sessionId: state.meta.sessionId,
+					sessionName: state.meta.sessionName,
+				}), 10_000);
+				state.lastPeerActivity = Date.now();
+			} catch {
+				// Remote unreachable — but don't immediately disconnect, let timeout handle it
+			}
+		}, HEARTBEAT_INTERVAL_MS);
 	}
 
 	// ─── Recovery ─────────────────────────────────────────────────────────
@@ -541,9 +778,9 @@ export default function (pi: ExtensionAPI) {
 	// ─── Commands ──────────────────────────────────────────────────────────
 
 	pi.registerCommand("link", {
-		description: "Manage session links (create, join, status, disconnect, version)",
+		description: "Manage session links (create, join, status, disconnect, version, list, HTTP remote)",
 		getArgumentCompletions: (prefix: string) => {
-			const cmds = ["create", "status", "disconnect", "version"];
+			const cmds = ["create", "status", "disconnect", "version", "list"];
 			const filtered = cmds.filter((c) => c.startsWith(prefix));
 			return filtered.length > 0 ? filtered.map((c) => ({ value: c, label: c })) : null;
 		},
@@ -559,8 +796,13 @@ export default function (pi: ExtensionAPI) {
 				case "status": return cmdStatus(c);
 				case "disconnect": return cmdDisconnect(c);
 				case "version": return cmdVersion(c);
+				case "list": return cmdList(c);
 				case "": return cmdJoin(c);
-				default: c.ui.notify(`Unknown: ${sub}. Use: /link [create|status|disconnect|version]`, "error");
+				default:
+					if (sub.startsWith("http://") || sub.startsWith("https://")) {
+						return cmdJoinHttp(sub, c);
+					}
+					c.ui.notify(`Unknown: ${sub}. Use: /link [create|status|disconnect|version|list|http://...]`, "error");
 			}
 		},
 	});
@@ -592,8 +834,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	async function cmdCreate(name: string, c: ExtensionContext): Promise<void> {
+	async function cmdCreate(args: string, c: ExtensionContext): Promise<void> {
 		if (state.mode !== "none") { c.ui.notify("Already linked. /link disconnect first.", "warning"); return; }
+
+		// Parse --http [port] flag
+		const httpMatch = args.match(/--http(?:\s+(\d+))?/);
+		const httpPort = httpMatch ? parseInt(httpMatch[1] || String(HTTP_LINK_DEFAULT_PORT), 10) : undefined;
+		const name = args.replace(/--http(?:\s+\d+)?/, "").trim();
 
 		ensureLinksDir();
 		const linkId = generateId();
@@ -646,12 +893,22 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		state.mode = "host";
+		state.transport = httpPort ? "http" : "uds";
 		state.linkId = linkId;
 		state.socketPath = sockPath;
 		state.meta = meta;
 		state.server = server;
 
-		c.ui.notify(`🔗 Link created: ${linkId} (${meta.sessionName})`, "success");
+		// Start HTTP adapter if requested
+		if (httpPort) {
+			const secret = ensureLinkSecret();
+			state.httpServer = startHttpAdapter(httpPort, secret);
+			state.httpPort = httpPort;
+			state.httpSecret = secret;
+			c.ui.notify(`🔗 Shared secret: ${secret.slice(0, 8)}... (full: ${HTTP_LINK_SECRET_FILE})`, "info");
+		}
+
+		c.ui.notify(`🔗 Link created: ${linkId} (${meta.sessionName})${httpPort ? ` [HTTP :${httpPort}]` : ""}`, "success");
 		updateWidget();
 	}
 
@@ -704,6 +961,51 @@ export default function (pi: ExtensionAPI) {
 		updateWidget();
 	}
 
+	async function cmdJoinHttp(url: string, c: ExtensionContext): Promise<void> {
+		if (state.mode !== "none") { c.ui.notify("Already linked. /link disconnect first.", "warning"); return; }
+
+		// Get shared secret
+		let secret = getLinkSecret();
+		if (!secret) {
+			c.ui.notify("No shared secret found. Set PI_LINK_SECRET env var or create ~/.pi/links/shared-secret on both machines.", "warning");
+			return;
+		}
+
+		try {
+			c.ui.notify(`🔗 Connecting to ${url}...`, "info");
+			await connectHttpRemote(url, secret);
+			c.ui.notify(`🔗 Connected (HTTP) → ${state.meta.sessionName}`, "success");
+			updateWidget();
+		} catch (err: any) {
+			c.ui.notify(`🔗 HTTP connection failed: ${err.message}`, "error");
+		}
+	}
+
+	function cmdList(c: ExtensionContext): void {
+		const localLinks = discoverLinks().filter((l) => l.meta.sessionId !== state.meta.sessionId);
+
+		const lines: string[] = [];
+		if (state.mode !== "none") {
+			lines.push(`Active: ${state.transport.toUpperCase()} → ${state.meta.sessionName} (${state.linkId.slice(0, 8)})`);
+			if (state.transport === "http" && state.httpPort) {
+				lines.push(`  HTTP port: ${state.httpPort}`);
+			}
+		}
+
+		if (localLinks.length > 0) {
+			lines.push(`\nLocal UDS links (${localLinks.length}):`);
+			for (const l of localLinks) {
+				const status = l.meta.status === "connected" ? "🔴 busy" : "🟢 idle";
+				lines.push(`  ${l.meta.sessionName} (${l.meta.model}) ${status} — ${l.meta.id.slice(0, 8)}`);
+			}
+		} else {
+			lines.push("\nNo local UDS links available.");
+		}
+
+		lines.push("\nTo join a remote link: /link http://host:port");
+		c.ui.notify(lines.join("\n"), "info");
+	}
+
 	function cmdStatus(c: ExtensionContext): void {
 		if (state.mode === "none") {
 			const available = discoverLinks();
@@ -713,10 +1015,15 @@ export default function (pi: ExtensionAPI) {
 
 		const lines = [
 			`Mode: ${state.mode} (${state.isConnected ? "connected" : "disconnected"})`,
+			`Transport: ${state.transport.toUpperCase()}`,
 			`Link ID: ${state.linkId}`,
 			`Session: ${state.meta.sessionName}`,
 			`Model: ${state.meta.model}`,
 		];
+		if (state.transport === "http") {
+			if (state.httpPort) lines.push(`HTTP port: ${state.httpPort}`);
+			if (state.httpRemoteUrl) lines.push(`Remote URL: ${state.httpRemoteUrl}`);
+		}
 		if (state.recovering) lines.push(`Status: recovering...`);
 		if (state.peerInfo?.sessionName) lines.push(`Peer: ${state.peerInfo.sessionName}`);
 		if (state.peerInfo?.model) lines.push(`Peer model: ${state.peerInfo.model}`);
@@ -784,6 +1091,7 @@ export default function (pi: ExtensionAPI) {
 			"Send a task/prompt to the linked pi session.",
 			'Default mode is "silent" — runs headless, peer context untouched.',
 			'Use mode "visible" to inject into peer session (collaborative).',
+			'Supports both UDS (local) and HTTP (remote) transports.',
 		].join(" "),
 		promptSnippet: "Send a task to a linked pi session for cross-session collaboration",
 		parameters: Type.Object({
@@ -795,11 +1103,6 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, onUpdate, c) {
 			if (!state.isConnected) {
 				return { content: [{ type: "text", text: "Not linked. Use /link to connect." }], details: { connected: false } };
-			}
-
-			const conn = state.connection;
-			if (!conn || conn.destroyed) {
-				return { content: [{ type: "text", text: "Connection lost." }], details: { connected: false }, isError: true };
 			}
 
 			const taskId = generateId();
@@ -822,6 +1125,46 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			onUpdate?.({ content: [{ type: "text", text: `Sending ${taskMode} task ${taskId.slice(0, 8)} to ${state.meta.sessionName}...` }] });
+
+			// HTTP transport: synchronous request-response
+			if (state.transport === "http" && state.httpRemoteUrl && state.httpSecret) {
+				try {
+					const response = await httpPostRpc(state.httpRemoteUrl, state.httpSecret, createJsonRpc("task/send", {
+						taskId,
+						prompt: params.prompt,
+						context,
+						mode: taskMode,
+						replyTo: params.reply_to ?? "sender",
+					}));
+
+					const result = response.result as any;
+					if (result?.status === "completed" && result.content) {
+						return {
+							content: [{ type: "text", text: result.content }],
+							details: { taskId, peer: state.meta.sessionName, mode: taskMode, sent: true, content: result.content },
+						};
+					}
+
+					const badge = taskMode === "visible" ? "👁" : "🔇";
+					return {
+						content: [{ type: "text", text: `Task ${taskId.slice(0, 8)} sent to ${state.meta.sessionName} (${badge}). Status: ${result?.status ?? "unknown"}` }],
+						details: { taskId, peer: state.meta.sessionName, mode: taskMode, sent: true },
+						terminate: taskMode === "silent",
+					};
+				} catch (err: any) {
+					return {
+						content: [{ type: "text", text: `HTTP task failed: ${err.message}` }],
+						details: { taskId, sent: false, error: err.message },
+						isError: true,
+					};
+				}
+			}
+
+			// UDS transport: async message
+			const conn = state.connection;
+			if (!conn || conn.destroyed) {
+				return { content: [{ type: "text", text: "Connection lost." }], details: { connected: false }, isError: true };
+			}
 
 			sendJsonRpc(conn, createJsonRpc("task/send", {
 				taskId,
@@ -859,9 +1202,22 @@ export default function (pi: ExtensionAPI) {
 		description: "Check the current link connection status and peer information.",
 		parameters: Type.Object({}),
 		async execute() {
+			const info: Record<string, unknown> = {
+				mode: state.mode,
+				transport: state.transport,
+				connected: state.isConnected,
+				linkId: state.linkId,
+				sessionName: state.meta.sessionName,
+				model: state.meta.model,
+				peer: state.peerInfo,
+			};
+			if (state.transport === "http") {
+				if (state.httpPort) info.httpPort = state.httpPort;
+				if (state.httpRemoteUrl) info.httpRemoteUrl = state.httpRemoteUrl;
+			}
 			return {
-				content: [{ type: "text", text: JSON.stringify({ mode: state.mode, connected: state.isConnected, linkId: state.linkId, sessionName: state.meta.sessionName, model: state.meta.model, peer: state.peerInfo }, null, 2) }],
-				details: { mode: state.mode, connected: state.isConnected, peer: state.peerInfo },
+				content: [{ type: "text", text: JSON.stringify(info, null, 2) }],
+				details: info,
 			};
 		},
 	});

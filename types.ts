@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as net from "node:net";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
@@ -12,6 +13,9 @@ export const STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const SOCKET_TIMEOUT_MS = 120_000;
 export const HEARTBEAT_TIMEOUT_MS = 60_000;
+export const HTTP_LINK_DEFAULT_PORT = 4567;
+export const HTTP_LINK_SECRET_FILE = path.join(LINKS_DIR, "shared-secret");
+export const HTTP_TASK_TIMEOUT_MS = 300_000;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -52,6 +56,7 @@ export interface LinkRecoveryData {
 
 export interface LinkState {
 	mode: "none" | "host" | "guest";
+	transport: "uds" | "http";
 	linkId: string;
 	socketPath: string;
 	meta: LinkMeta;
@@ -65,11 +70,16 @@ export interface LinkState {
 	lastPeerActivity: number;
 	pendingTask?: PendingTask;
 	recovering: boolean;
+	httpServer?: import("node:http").Server;
+	httpPort?: number;
+	httpRemoteUrl?: string;
+	httpSecret?: string;
 }
 
 export function createInitialState(): LinkState {
 	return {
 		mode: "none",
+		transport: "uds",
 		linkId: "",
 		socketPath: "",
 		meta: {
@@ -204,6 +214,61 @@ export function deleteRecoveryData(sessionId: string): void {
 
 export function createJsonRpc(method: string, params: Record<string, unknown>): JsonRpcMessage {
 	return { jsonrpc: "2.0", id: crypto.randomUUID(), method, params };
+}
+
+// ─── HTTP helpers ───────────────────────────────────────────────────────
+
+export function getLinkSecret(): string {
+	const envSecret = process.env.PI_LINK_SECRET;
+	if (envSecret) return envSecret;
+	try {
+		return fs.readFileSync(HTTP_LINK_SECRET_FILE, "utf-8").trim();
+	} catch {
+		return "";
+	}
+}
+
+export function ensureLinkSecret(): string {
+	let secret = getLinkSecret();
+	if (!secret) {
+		secret = crypto.randomBytes(16).toString("hex");
+		ensureLinksDir();
+		fs.writeFileSync(HTTP_LINK_SECRET_FILE, secret, { encoding: "utf-8", mode: 0o600 });
+	}
+	return secret;
+}
+
+export function httpPostRpc(
+	baseUrl: string,
+	secret: string,
+	msg: JsonRpcMessage,
+	timeoutMs = HTTP_TASK_TIMEOUT_MS,
+): Promise<JsonRpcMessage> {
+	const rpcUrl = baseUrl.replace(/\/$/, "") + "/rpc";
+	const body = JSON.stringify(msg);
+
+	return new Promise((resolve, reject) => {
+		const r = http.request(rpcUrl, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Content-Length": Buffer.byteLength(body),
+				Authorization: `Bearer ${secret}`,
+			},
+			timeout: timeoutMs,
+		}, (res) => {
+			let data = "";
+			res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+			res.on("end", () => {
+				try { resolve(JSON.parse(data) as JsonRpcMessage); }
+				catch { reject(new Error("Invalid JSON response from remote")); }
+			});
+		});
+		r.on("error", reject);
+		r.on("timeout", () => { r.destroy(); reject(new Error("HTTP request timed out")); });
+		r.write(body);
+		r.end();
+	});
 }
 
 export function sendJsonRpc(socket: net.Socket, msg: JsonRpcMessage): void {
