@@ -12,11 +12,8 @@ import * as path from "node:path";
 import * as crypto from "node:crypto";
 import {
 	LINKS_DIR,
-	LINK_RECOVERY_DIR,
 	STALE_THRESHOLD_MS,
-	HEARTBEAT_INTERVAL_MS,
 	HEARTBEAT_TIMEOUT_MS,
-	SOCKET_TIMEOUT_MS,
 	type LinkMeta,
 	type JsonRpcMessage,
 	type LinkRecoveryData,
@@ -38,15 +35,15 @@ import {
 
 let passed = 0;
 let failed = 0;
-const TEST_LINKS_DIR = path.join(os.tmpdir(), `pi-link-test-${crypto.randomBytes(4).toString("hex")}`);
-const TEST_RECOVERY_DIR = path.join(os.tmpdir(), `pi-link-recovery-test-${crypto.randomBytes(4).toString("hex")}`);
+const PREFIX = `__test_${crypto.randomBytes(4).toString("hex")}_`;
+const createdDirs: string[] = [];
 
-// Monkey-patch the dirs for testing
-import * as types from "./types.js";
-const origLinksDir = (types as any).LINKS_DIR;
-const origRecoveryDir = (types as any).LINK_RECOVERY_DIR;
-(types as any).LINKS_DIR = TEST_LINKS_DIR;
-(types as any).LINK_RECOVERY_DIR = TEST_RECOVERY_DIR;
+function testDir(id: string): string {
+	const dir = path.join(LINKS_DIR, `${PREFIX}${id}`);
+	fs.mkdirSync(dir, { recursive: true });
+	createdDirs.push(dir);
+	return dir;
+}
 
 function test(name: string, fn: () => void | Promise<void>): void {
 	try {
@@ -77,6 +74,7 @@ function assertEq<T>(actual: T, expected: T, msg?: string): void {
 // ─── Setup ────────────────────────────────────────────────────────────────
 
 console.log("\n📋 pi-link-extension tests\n");
+ensureLinksDir();
 
 // ─── Types / Constants ───────────────────────────────────────────────────
 
@@ -144,27 +142,34 @@ test("parseJsonRpcLines skips malformed lines", () => {
 	assertEq(messages.length, 1);
 });
 
-test("sendJsonRpc writes newline-delimited JSON to socket", (done) => {
-	const server = net.createServer((socket) => {
-		let data = "";
-		socket.on("data", (d) => { data += d.toString(); });
-		socket.on("end", () => {
-			const lines = data.trim().split("\n");
-			assertEq(lines.length, 2, "should have 2 messages");
-			const parsed = lines.map((l) => JSON.parse(l));
-			assertEq(parsed[0].method, "ping");
-			assertEq(parsed[1].method, "pong");
-			socket.end();
-			server.close();
-			done();
+test("sendJsonRpc writes newline-delimited JSON to socket", () => {
+	return new Promise<void>((resolve, reject) => {
+		const server = net.createServer((socket) => {
+			let data = "";
+			socket.on("data", (d) => { data += d.toString(); });
+			socket.on("end", () => {
+				try {
+					const lines = data.trim().split("\n");
+					assertEq(lines.length, 2, "should have 2 messages");
+					const parsed = lines.map((l) => JSON.parse(l));
+					assertEq(parsed[0].method, "ping");
+					assertEq(parsed[1].method, "pong");
+					socket.end();
+					server.close();
+					resolve();
+				} catch (err) {
+					reject(err);
+				}
+			});
 		});
-	});
-	server.listen(() => {
-		const sock = new net.Socket();
-		sock.connect((server as any).address().port, "127.0.0.1", () => {
-			sendJsonRpc(sock, createJsonRpc("ping", {}));
-			sendJsonRpc(sock, createJsonRpc("pong", {}));
-			sock.end();
+		server.listen(() => {
+			const addr = server.address() as net.AddressInfo;
+			const sock = new net.Socket();
+			sock.connect(addr.port, "127.0.0.1", () => {
+				sendJsonRpc(sock, createJsonRpc("ping", {}));
+				sendJsonRpc(sock, createJsonRpc("pong", {}));
+				sock.end();
+			});
 		});
 	});
 });
@@ -172,13 +177,8 @@ test("sendJsonRpc writes newline-delimited JSON to socket", (done) => {
 // ─── Link Directory ──────────────────────────────────────────────────────
 
 console.log("\nLink Directory:");
-test("ensureLinksDir creates directory", () => {
-	ensureLinksDir();
-	assert(fs.existsSync(TEST_LINKS_DIR), "dir should exist");
-});
-
 test("writeMeta + readMeta round-trip", () => {
-	const linkDir = path.join(TEST_LINKS_DIR, "test-meta");
+	const linkDir = testDir("meta-roundtrip");
 	const meta: LinkMeta = {
 		id: "abc123",
 		sessionId: "sess1",
@@ -197,14 +197,14 @@ test("writeMeta + readMeta round-trip", () => {
 });
 
 test("readMeta returns null for missing dir", () => {
-	const read = readMeta(path.join(TEST_LINKS_DIR, "nonexistent"));
+	const read = readMeta(path.join(LINKS_DIR, "nonexistent-test-dir"));
 	assertEq(read, null);
 });
 
 test("discoverLinks finds active links", () => {
-	const linkDir = path.join(TEST_LINKS_DIR, "discover-test");
+	const linkDir = testDir("discover-active");
 	const meta: LinkMeta = {
-		id: "discover1",
+		id: `${PREFIX}discover1`,
 		sessionId: "sess-disc",
 		sessionName: "discoverable",
 		model: "test/model",
@@ -214,13 +214,13 @@ test("discoverLinks finds active links", () => {
 	};
 	writeMeta(linkDir, meta);
 	const links = discoverLinks();
-	assert(links.some((l) => l.meta.id === "discover1"), "should find discover1");
+	assert(links.some((l) => l.meta.id === `${PREFIX}discover1`), "should find discover1");
 });
 
 test("discoverLinks skips stale links", () => {
-	const linkDir = path.join(TEST_LINKS_DIR, "stale-test");
+	const linkDir = testDir("discover-stale");
 	const meta: LinkMeta = {
-		id: "stale1",
+		id: `${PREFIX}stale1`,
 		sessionId: "sess-stale",
 		sessionName: "stale",
 		model: "test/model",
@@ -230,12 +230,11 @@ test("discoverLinks skips stale links", () => {
 	};
 	writeMeta(linkDir, meta);
 	const links = discoverLinks();
-	assert(!links.some((l) => l.meta.id === "stale1"), "should not find stale1");
+	assert(!links.some((l) => l.meta.id === `${PREFIX}stale1`), "should not find stale1");
 });
 
 test("cleanupLinkDir removes directory", () => {
-	const linkDir = path.join(TEST_LINKS_DIR, "cleanup-test");
-	fs.mkdirSync(linkDir, { recursive: true });
+	const linkDir = testDir("cleanup-dir");
 	fs.writeFileSync(path.join(linkDir, "meta.json"), "{}");
 	assert(fs.existsSync(linkDir), "dir should exist before cleanup");
 	cleanupLinkDir(linkDir);
@@ -246,7 +245,7 @@ test("cleanupLinkDir removes directory", () => {
 
 console.log("\nRecovery Data:");
 test("saveRecoveryData + loadRecoveryData round-trip", () => {
-	const sessionId = "test-session-recovery";
+	const sessionId = `${PREFIX}recovery-rt`;
 	const data: LinkRecoveryData = {
 		sessionId,
 		mode: "host",
@@ -269,16 +268,17 @@ test("saveRecoveryData + loadRecoveryData round-trip", () => {
 	assertEq(loaded!.mode, "host");
 	assertEq(loaded!.linkId, "link-abc");
 	assertEq(loaded!.peerInfo?.sessionName, "peer-session");
+	deleteRecoveryData(sessionId);
 });
 
 test("loadRecoveryData returns null for missing", () => {
-	const loaded = loadRecoveryData("nonexistent-session");
+	const loaded = loadRecoveryData(`${PREFIX}nonexistent-session`);
 	assertEq(loaded, null);
 });
 
 test("deleteRecoveryData removes file", () => {
-	const sessionId = "delete-test-session";
-	const data: LinkRecoveryData = {
+	const sessionId = `${PREFIX}delete-test`;
+	saveRecoveryData(sessionId, {
 		sessionId,
 		mode: "guest",
 		linkId: "link-del",
@@ -292,15 +292,14 @@ test("deleteRecoveryData removes file", () => {
 			status: "connected",
 		},
 		savedAt: Date.now(),
-	};
-	saveRecoveryData(sessionId, data);
+	});
 	assert(loadRecoveryData(sessionId) !== null, "should exist before delete");
 	deleteRecoveryData(sessionId);
 	assertEq(loadRecoveryData(sessionId), null);
 });
 
 test("recovery file has restrictive permissions (0600)", () => {
-	const sessionId = "perms-test-session";
+	const sessionId = `${PREFIX}perms-test`;
 	saveRecoveryData(sessionId, {
 		sessionId,
 		mode: "host",
@@ -319,128 +318,15 @@ test("recovery file has restrictive permissions (0600)", () => {
 	const stat = fs.statSync(getRecoveryFilePath(sessionId));
 	const mode = stat.mode & 0o777;
 	assertEq(mode, 0o600, "should be 0600");
+	deleteRecoveryData(sessionId);
 });
 
-// ─── UDS Connection (integration) ────────────────────────────────────────
-
-console.log("\nUDS Connection:");
-
-async function testUdsConnection(): Promise<void> {
-	const sockPath = path.join(TEST_LINKS_DIR, `test-uds-${generateId()}.sock`);
-	const server = net.createServer((socket) => {
-		socket.on("data", (data) => {
-			const msgs = parseJsonRpcLines(data.toString());
-			for (const msg of msgs.messages) {
-				if (msg.method === "ping") {
-					sendJsonRpc(socket, { jsonrpc: "2.0", id: msg.id, result: { pong: true } });
-				}
-			}
-		});
-	});
-
-	await new Promise<void>((resolve, reject) => {
-		server.listen(sockPath, () => resolve());
-		server.on("error", reject);
-	});
-
-	const client = new net.Socket();
-	await new Promise<void>((resolve, reject) => {
-		client.connect(sockPath, () => resolve());
-		client.on("error", reject);
-	});
-
-	// Send ping and await response
-	const ping = createJsonRpc("ping", { test: true });
-	sendJsonRpc(client, ping);
-
-	const response = await new Promise<JsonRpcMessage>((resolve) => {
-		let buf = "";
-		client.on("data", (data) => {
-			buf += data.toString();
-			const { messages } = parseJsonRpcLines(buf);
-			if (messages.length > 0) resolve(messages[0]);
-		});
-	});
-
-	assertEq(response.id, ping.id, "response id should match ping id");
-	assertEq((response.result as any)?.pong, true, "should have pong result");
-
-	client.destroy();
-	server.close();
-	fs.unlinkSync(sockPath);
-}
-
-test("UDS ping/pong round-trip", () => testUdsConnection());
-
-async function testHalfOpenDetection(): Promise<void> {
-	const sockPath = path.join(TEST_LINKS_DIR, `test-halfopen-${generateId()}.sock`);
-
-	// Create a server that accepts but never responds
-	const server = net.createServer((socket) => {
-		// Intentionally don't set up any data handler — simulates half-open
-	});
-
-	await new Promise<void>((resolve) => {
-		server.listen(sockPath, () => resolve());
-	});
-
-	const client = new net.Socket();
-	await new Promise<void>((resolve) => {
-		client.connect(sockPath, () => resolve());
-	});
-
-	// Track lastPeerActivity
-	let lastPeerActivity = Date.now();
-
-	// Simulate heartbeat check (should detect no activity)
-	const ping = createJsonRpc("ping", {});
-	sendJsonRpc(client, ping);
-
-	// Simulate time passing without response
-	lastPeerActivity = Date.now() - HEARTBEAT_TIMEOUT_MS - 1000;
-	const isHalfOpen = lastPeerActivity > 0 && Date.now() - lastPeerActivity > HEARTBEAT_TIMEOUT_MS;
-	assert(isHalfOpen, "should detect half-open connection");
-
-	client.destroy();
-	server.close();
-	fs.unlinkSync(sockPath);
-}
-
-test("half-open detection logic works", () => testHalfOpenDetection());
-
-async function testDisconnectClean(): Promise<void> {
-	const sockPath = path.join(TEST_LINKS_DIR, `test-disconnect-${generateId()}.sock`);
-
-	let serverClosed = false;
-	const server = net.createServer((socket) => {
-		socket.on("close", () => { serverClosed = true; });
-	});
-
-	await new Promise<void>((resolve) => {
-		server.listen(sockPath, () => resolve());
-	});
-
-	const client = new net.Socket();
-	await new Promise<void>((resolve) => {
-		client.connect(sockPath, () => resolve());
-	});
-
-	client.destroy();
-
-	// Wait for close event
-	await new Promise<void>((resolve) => setTimeout(resolve, 100));
-	assert(serverClosed, "server should detect client disconnect");
-
-	server.close();
-	fs.unlinkSync(sockPath);
-}
-
-test("server detects client disconnect", () => testDisconnectClean());
-
-async function testRecoverySurvivesCleanup(): Promise<void> {
-	// Simulate the session_shutdown → cleanup ordering
-	const sessionId = "recovery-survive-test";
-	const data: LinkRecoveryData = {
+test("recovery data survives cleanup (fix verification)", () => {
+	// Simulate session_shutdown → cleanup on reload:
+	// 1. saveRecoveryData (session_shutdown saves state)
+	// 2. cleanup() runs but should NOT delete recovery data (the fix)
+	const sessionId = `${PREFIX}survive-cleanup`;
+	saveRecoveryData(sessionId, {
 		sessionId,
 		mode: "host",
 		linkId: "link-survive",
@@ -454,33 +340,127 @@ async function testRecoverySurvivesCleanup(): Promise<void> {
 			status: "connected",
 		},
 		savedAt: Date.now(),
-	};
+	});
 
-	// Save recovery data (like session_shutdown does on reload)
-	saveRecoveryData(sessionId, data);
-
-	// Simulate cleanup() — should NOT delete recovery data
-	// (This is the fix: cleanup no longer calls deleteRecoveryData)
+	// Simulate cleanup() — no longer calls deleteRecoveryData
 	const loaded = loadRecoveryData(sessionId);
 	assert(loaded !== null, "recovery data should survive cleanup");
 
-	// Only explicit disconnect should delete
+	// Only explicit disconnect (cmdDisconnect) should delete
 	deleteRecoveryData(sessionId);
 	assertEq(loadRecoveryData(sessionId), null, "should be deleted after explicit delete");
-}
+});
 
-test("recovery data survives cleanup (fix verification)", () => testRecoverySurvivesCleanup());
+// ─── UDS Connection (integration) ────────────────────────────────────────
+
+console.log("\nUDS Connection:");
+
+test("UDS ping/pong round-trip", () => {
+	const sockPath = testDir("uds-ping") + "/link.sock";
+	return new Promise<void>((resolve, reject) => {
+		const server = net.createServer((socket) => {
+			socket.on("data", (data) => {
+				const msgs = parseJsonRpcLines(data.toString());
+				for (const msg of msgs.messages) {
+					if (msg.method === "ping") {
+						sendJsonRpc(socket, { jsonrpc: "2.0", id: msg.id, result: { pong: true } });
+					}
+				}
+			});
+		});
+
+		server.listen(sockPath, () => {
+			const client = new net.Socket();
+			client.connect(sockPath, () => {
+				const ping = createJsonRpc("ping", { test: true });
+				sendJsonRpc(client, ping);
+
+				let buf = "";
+				client.on("data", (data) => {
+					buf += data.toString();
+					const { messages } = parseJsonRpcLines(buf);
+					if (messages.length > 0) {
+						try {
+							assertEq(messages[0].id, ping.id, "response id should match");
+							assertEq((messages[0].result as any)?.pong, true, "should have pong");
+							client.destroy();
+							server.close();
+							resolve();
+						} catch (err) {
+							reject(err);
+						}
+					}
+				});
+			});
+			client.on("error", reject);
+		});
+		server.on("error", reject);
+	});
+});
+
+test("half-open detection logic", () => {
+	// Pure logic test: verify the condition used in startHeartbeat
+	let lastPeerActivity = Date.now() - HEARTBEAT_TIMEOUT_MS - 5000;
+	const isHalfOpen = lastPeerActivity > 0 && Date.now() - lastPeerActivity > HEARTBEAT_TIMEOUT_MS;
+	assert(isHalfOpen, "should detect half-open when activity is stale");
+
+	// Fresh activity should not trigger
+	lastPeerActivity = Date.now();
+	const isFresh = !(lastPeerActivity > 0 && Date.now() - lastPeerActivity > HEARTBEAT_TIMEOUT_MS);
+	assert(isFresh, "should not detect half-open with fresh activity");
+});
+
+test("server detects client disconnect", () => {
+	const sockPath = testDir("uds-disconnect") + "/link.sock";
+	return new Promise<void>((resolve, reject) => {
+		let serverGotClose = false;
+		const server = net.createServer((socket) => {
+			socket.on("close", () => { serverGotClose = true; });
+		});
+
+		server.listen(sockPath, () => {
+			const client = new net.Socket();
+			client.connect(sockPath, () => {
+				client.destroy();
+			});
+			client.on("error", () => {});
+		});
+
+		setTimeout(() => {
+			try {
+				assert(serverGotClose, "server should detect client disconnect");
+				server.close();
+				resolve();
+			} catch (err) {
+				reject(err);
+			}
+		}, 200);
+	});
+});
+
+test("writeMeta handles ENOENT gracefully (peer cleaned up dir)", () => {
+	const linkDir = path.join(LINKS_DIR, `${PREFIX}enoent-test-${Date.now()}`);
+	// Don't create the dir — writeMeta should not throw
+	writeMeta(linkDir, {
+		id: "enoent",
+		sessionId: "enoent-sess",
+		sessionName: "enoent",
+		model: "test/model",
+		created: Date.now(),
+		lastHeartbeat: Date.now(),
+		status: "waiting",
+	});
+	// If we got here, no exception was thrown
+	assert(true, "writeMeta should not throw on ENOENT");
+});
 
 // ─── Teardown + Summary ──────────────────────────────────────────────────
 
 setTimeout(() => {
-	// Clean up test dirs
-	try { fs.rmSync(TEST_LINKS_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
-	try { fs.rmSync(TEST_RECOVERY_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
-
-	// Restore original dirs
-	(types as any).LINKS_DIR = origLinksDir;
-	(types as any).LINK_RECOVERY_DIR = origRecoveryDir;
+	// Clean up all test directories
+	for (const dir of createdDirs) {
+		try { cleanupLinkDir(dir); } catch { /* best effort */ }
+	}
 
 	console.log(`\n${"─".repeat(40)}`);
 	console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
