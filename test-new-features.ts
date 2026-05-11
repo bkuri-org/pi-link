@@ -1,12 +1,31 @@
 /**
- * Tests for multi-link support in pi-link-extension
+ * Tests for new features: multi-link (pz6), streaming (8jk), HTTP adapter (b6e)
  *
- * Tests linksRegistry add/remove/get, target resolution, and multi-link isolation.
  * Run: npx -y tsx test-new-features.ts
  */
 
+import * as fs from "node:fs";
+import * as net from "node:net";
+import * as http from "node:http";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as crypto from "node:crypto";
-import { type LinkState, createInitialState } from "./types.js";
+import {
+	LINKS_DIR,
+	type LinkMeta,
+	type LinkState,
+	type JsonRpcMessage,
+	createInitialState,
+	ensureLinksDir,
+	generateId,
+	createJsonRpc,
+	sendJsonRpc,
+	parseJsonRpcLines,
+	ensureLinkSecret,
+	httpPostRpc,
+} from "./types.js";
+
+// ─── Test runner (same pattern as test-link.ts) ───────────────────────────
 
 let passed = 0;
 let failed = 0;
@@ -37,1014 +56,1528 @@ function assertEq<T>(actual: T, expected: T, msg?: string): void {
 	if (actual !== expected) throw new Error(msg ?? `Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
-// ─── Helpers: replicate the registry logic from index.ts ────────────────
+// ─── Helpers: replicate multi-link registry logic from index.ts ───────────
 
-function makeLink(overrides: Partial<LinkState> & { linkId: string }): LinkState {
+function makeLink(opts: {
+	linkId: string;
+	sessionName?: string;
+	mode?: LinkState["mode"];
+	isConnected?: boolean;
+	transport?: LinkState["transport"];
+	peerInfo?: LinkState["peerInfo"];
+}): LinkState {
 	const link = createInitialState();
-	Object.assign(link, overrides);
-	if (overrides.meta) Object.assign(link.meta, overrides.meta);
+	link.linkId = opts.linkId;
+	link.meta = {
+		id: opts.linkId,
+		sessionId: `sess-${opts.linkId}`,
+		sessionName: opts.sessionName ?? opts.linkId,
+		model: "test/model",
+		created: Date.now(),
+		lastHeartbeat: Date.now(),
+		status: "connected",
+	};
+	if (opts.mode) link.mode = opts.mode;
+	if (opts.isConnected !== undefined) link.isConnected = opts.isConnected;
+	if (opts.transport) link.transport = opts.transport;
+	if (opts.peerInfo) link.peerInfo = opts.peerInfo;
 	return link;
 }
 
-/**
- * Replicate the addLink logic from index.ts:
- *   linksRegistry.set(link.linkId, link)
- *   state = link
- */
-function addLink(
-	registry: Map<string, LinkState>,
-	link: LinkState,
-	active: { current: LinkState },
-): void {
-	registry.set(link.linkId, link);
-	active.current = link;
-}
+/** Replicate linksRegistry CRUD from index.ts */
+function createRegistry() {
+	const linksRegistry = new Map<string, LinkState>();
+	const stateRef = { current: createInitialState() as LinkState };
 
-/**
- * Replicate the removeLink logic from index.ts:
- *   linksRegistry.delete(linkId)
- *   If active was removed, pick next connected, then first available, then initial state
- */
-function removeLink(
-	registry: Map<string, LinkState>,
-	linkId: string,
-	active: { current: LinkState },
-): void {
-	registry.delete(linkId);
-	if (active.current.linkId === linkId) {
-		let next: LinkState | undefined;
-		for (const l of registry.values()) {
-			if (l.isConnected) { next = l; break; }
+	function addLink(link: LinkState) {
+		linksRegistry.set(link.linkId, link);
+		stateRef.current = link;
+	}
+
+	function removeLink(linkId: string) {
+		linksRegistry.delete(linkId);
+		if (stateRef.current.linkId === linkId) {
+			let next: LinkState | undefined;
+			for (const l of linksRegistry.values()) {
+				if (l.isConnected) { next = l; break; }
+			}
+			if (!next) next = linksRegistry.values().next().value;
+			stateRef.current = next ?? createInitialState();
 		}
-		if (!next) next = registry.values().next().value;
-		active.current = next ?? createInitialState();
 	}
+
+	function getActiveLink(): LinkState | undefined {
+		if (stateRef.current.mode !== "none") return stateRef.current;
+		return undefined;
+	}
+
+	function resolveTargetLink(target: string | undefined): LinkState | undefined {
+		if (!target) return getActiveLink();
+		for (const [id, link] of linksRegistry) {
+			if (id.startsWith(target)) return link;
+		}
+		for (const link of linksRegistry.values()) {
+			if (link.meta.sessionName === target) return link;
+		}
+		for (const link of linksRegistry.values()) {
+			if (link.peerInfo?.sessionName === target) return link;
+		}
+		const idx = parseInt(target, 10);
+		if (!isNaN(idx)) {
+			return [...linksRegistry.values()][idx];
+		}
+		return undefined;
+	}
+
+	return { linksRegistry, state: stateRef, addLink, removeLink, getActiveLink, resolveTargetLink };
 }
 
-/**
- * Replicate the resolveTargetLink logic from index.ts.
- * Resolves by: ID prefix → session name → peer session name → index
- */
-function resolveTargetLink(
-	registry: Map<string, LinkState>,
-	active: LinkState,
-	target: string | undefined,
-): LinkState | undefined {
-	if (!target) {
-		return active.mode !== "none" ? active : undefined;
-	}
+// ─── HTTP test helpers ────────────────────────────────────────────────────
 
-	// By ID prefix
-	for (const [id, link] of registry) {
-		if (id.startsWith(target)) return link;
-	}
-
-	// By session name
-	for (const link of registry.values()) {
-		if (link.meta.sessionName === target) return link;
-	}
-
-	// By peer session name
-	for (const link of registry.values()) {
-		if (link.peerInfo?.sessionName === target) return link;
-	}
-
-	// By index
-	const idx = parseInt(target, 10);
-	if (!isNaN(idx)) {
-		const links = [...registry.values()];
-		return links[idx];
-	}
-
-	return undefined;
-}
-
-// ─── Tests ───────────────────────────────────────────────────────────────
-
-console.log("\n📋 Multi-link support tests\n");
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 1. linksRegistry add/remove/get operations
-// ═══════════════════════════════════════════════════════════════════════════
-
-console.log("linksRegistry add/remove/get:");
-
-test("addLink inserts into registry and sets active", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
-
-	const link = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "session-alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
+function getFreePort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const srv = net.createServer();
+		srv.listen(0, "127.0.0.1", () => {
+			const addr = srv.address() as net.AddressInfo;
+			srv.close(() => resolve(addr.port));
+		});
+		srv.on("error", reject);
 	});
+}
 
-	addLink(registry, link, active);
+function createTestHttpServer(link: LinkState, secret: string, port: number): Promise<http.Server> {
+	return new Promise((resolve, reject) => {
+		function readBody(req: http.IncomingMessage): Promise<string> {
+			return new Promise((res, rej) => {
+				const chunks: Buffer[] = [];
+				req.on("data", (chunk: Buffer) => chunks.push(chunk));
+				req.on("end", () => res(Buffer.concat(chunks).toString()));
+				req.on("error", rej);
+			});
+		}
 
-	assertEq(registry.size, 1, "registry should have 1 link");
-	assert(registry.has("aaa11111"), "registry should contain link by ID");
-	assertEq(active.current.linkId, "aaa11111", "active should be the new link");
+		const server = http.createServer(async (req, res) => {
+			res.setHeader("Access-Control-Allow-Origin", "*");
+			res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+			res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+			if (req.method === "OPTIONS") {
+				res.writeHead(204);
+				res.end();
+				return;
+			}
+
+			const auth = req.headers["authorization"];
+			if (auth !== `Bearer ${secret}`) {
+				res.writeHead(401, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: 401, message: "Unauthorized" }, id: null }));
+				return;
+			}
+
+			if (req.url === "/.well-known/agent.json" && req.method === "GET") {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({
+					name: link.meta.sessionName,
+					url: `http://0.0.0.0:${port}`,
+					model: link.meta.model,
+					sessionId: link.meta.sessionId,
+					protocol: "pi-link",
+					version: "v0.2.0",
+					skills: ["task/send", "ping", "version/get"],
+				}));
+				return;
+			}
+
+			if (req.url === "/health" && req.method === "GET") {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ status: "ok", session: link.meta.sessionName, transport: "http" }));
+				return;
+			}
+
+			if (req.url === "/rpc" && req.method === "POST") {
+				try {
+					const body = await readBody(req);
+					const msg = JSON.parse(body) as JsonRpcMessage;
+
+					if (msg.method === "ping") {
+						res.writeHead(200, { "Content-Type": "application/json" });
+						res.end(JSON.stringify({
+							jsonrpc: "2.0", id: msg.id,
+							result: { sessionId: link.meta.sessionId, sessionName: link.meta.sessionName, model: link.meta.model },
+						}));
+						return;
+					}
+					if (msg.method === "task/send") {
+						const p = msg.params as any;
+						if (!p?.prompt) {
+							res.writeHead(200, { "Content-Type": "application/json" });
+							res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Missing prompt parameter" } }));
+							return;
+						}
+						res.writeHead(200, { "Content-Type": "application/json" });
+						res.end(JSON.stringify({
+							jsonrpc: "2.0", id: msg.id,
+							result: { taskId: p.taskId, status: "received", mode: p.mode ?? "silent" },
+						}));
+						return;
+					}
+					res.writeHead(200, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } }));
+				} catch (err: any) {
+					res.writeHead(500, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: err.message }, id: null }));
+				}
+				return;
+			}
+
+			res.writeHead(404);
+			res.end("Not found");
+		});
+
+		server.listen(port, "127.0.0.1", () => resolve(server));
+		server.on("error", reject);
+	});
+}
+
+function httpGet(url: string, headers: Record<string, string> = {}): Promise<{ statusCode: number; body: string }> {
+	return new Promise((resolve, reject) => {
+		const r = http.request(url, { method: "GET", headers, timeout: 5000 }, (res) => {
+			let data = "";
+			res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+			res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, body: data }));
+		});
+		r.on("error", reject);
+		r.on("timeout", () => { r.destroy(); reject(new Error("timeout")); });
+		r.end();
+	});
+}
+
+function httpPost(url: string, body: string, headers: Record<string, string> = {}): Promise<{ statusCode: number; resBody: string }> {
+	return new Promise((resolve, reject) => {
+		const r = http.request(url, { method: "POST", headers, timeout: 5000 }, (res) => {
+			let data = "";
+			res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+			res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, resBody: data }));
+		});
+		r.on("error", reject);
+		r.on("timeout", () => { r.destroy(); reject(new Error("timeout")); });
+		r.write(body);
+		r.end();
+	});
+}
+
+// Shared test fixture for HTTP tests
+const testSecret = `test-secret-${crypto.randomBytes(8).toString("hex")}`;
+const testLink = makeLink({ linkId: "httptest", sessionName: "http-test-session" });
+
+// ─── Setup ────────────────────────────────────────────────────────────────
+
+console.log("\n📋 pi-link-extension — new feature tests\n");
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1. MULTI-LINK (pz6) — linksRegistry CRUD, target resolution, list output
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log("── Multi-link (pz6) ──");
+
+console.log("\n  linksRegistry CRUD:");
+
+test("addLink adds to registry and sets active", () => {
+	const reg = createRegistry();
+	assertEq(reg.linksRegistry.size, 0);
+	assertEq(reg.getActiveLink(), undefined);
+
+	const link = makeLink({ linkId: "abc12345", mode: "host", isConnected: true, sessionName: "host-alpha" });
+	reg.addLink(link);
+
+	assertEq(reg.linksRegistry.size, 1);
+	assert(reg.linksRegistry.has("abc12345"), "registry should contain link by ID");
+	assertEq(reg.getActiveLink()?.linkId, "abc12345");
+	assertEq(reg.state.current.linkId, "abc12345");
 });
 
-test("addLink multiple links each become active", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+test("addLink multiple links — last added is active", () => {
+	const reg = createRegistry();
+	const link1 = makeLink({ linkId: "11111111", mode: "host", isConnected: true, sessionName: "first" });
+	const link2 = makeLink({ linkId: "22222222", mode: "guest", isConnected: true, sessionName: "second" });
 
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
+	reg.addLink(link1);
+	assertEq(reg.state.current.linkId, "11111111", "first should be active after add");
 
-	addLink(registry, linkA, active);
-	assertEq(active.current.linkId, "aaa11111", "first link should be active");
-
-	addLink(registry, linkB, active);
-	assertEq(active.current.linkId, "bbb22222", "second link should become active");
-	assertEq(registry.size, 2, "registry should have 2 links");
+	reg.addLink(link2);
+	assertEq(reg.linksRegistry.size, 2);
+	assertEq(reg.state.current.linkId, "22222222", "last added should be active");
 });
 
 test("removeLink removes from registry", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "del00001", mode: "host", isConnected: true, sessionName: "to-delete" }));
+	assertEq(reg.linksRegistry.size, 1);
 
-	const link = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	addLink(registry, link, active);
-	assertEq(registry.size, 1);
-
-	removeLink(registry, "aaa11111", active);
-	assertEq(registry.size, 0, "registry should be empty after removal");
-	assertEq(active.current.mode, "none", "active should reset to initial state");
+	reg.removeLink("del00001");
+	assertEq(reg.linksRegistry.size, 0);
+	assertEq(reg.getActiveLink(), undefined);
+	assertEq(reg.state.current.mode, "none");
 });
 
-test("removeLink non-active link keeps active unchanged", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+test("removeLink active — falls back to next connected link", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "active01", mode: "host", isConnected: true, sessionName: "active-link" }));
+	reg.addLink(makeLink({ linkId: "other002", mode: "guest", isConnected: true, sessionName: "other-link" }));
+	assertEq(reg.state.current.linkId, "other002", "other should be active (last added)");
 
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
-
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
-	assertEq(active.current.linkId, "bbb22222", "B should be active");
-
-	// Remove A (not active)
-	removeLink(registry, "aaa11111", active);
-	assertEq(registry.size, 1, "registry should have 1 link");
-	assertEq(active.current.linkId, "bbb22222", "active should still be B");
+	reg.removeLink("other002");
+	assertEq(reg.linksRegistry.size, 1);
+	assertEq(reg.state.current.linkId, "active01", "should fall back to connected link");
 });
 
-test("removeLink active link falls back to next connected", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+test("removeLink active — falls back to any remaining link if none connected", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "active01", mode: "host", isConnected: true, sessionName: "active" }));
+	reg.addLink(makeLink({ linkId: "disc0002", mode: "guest", isConnected: false, sessionName: "disconnected" }));
 
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
-	const linkC = makeLink({
-		linkId: "ccc33333",
-		mode: "guest",
-		isConnected: false,
-		meta: { sessionName: "gamma", sessionId: "s3", model: "m3", created: 3, lastHeartbeat: 3, status: "waiting" },
-	});
-
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
-	addLink(registry, linkC, active);
-	assertEq(active.current.linkId, "ccc33333", "C should be active (last added)");
-
-	// Remove active (C) — should fall back to A (first connected)
-	removeLink(registry, "ccc33333", active);
-	assertEq(active.current.linkId, "aaa11111", "should fall back to first connected link (A)");
+	reg.removeLink("active01");
+	assertEq(reg.linksRegistry.size, 1);
+	assertEq(reg.state.current.linkId, "disc0002", "should fall back to remaining link even if disconnected");
 });
 
-test("removeLink active with no connected falls back to first available", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+test("removeLink non-active — active link stays", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "keep0001", mode: "host", isConnected: true, sessionName: "keeper" }));
+	reg.addLink(makeLink({ linkId: "remove02", mode: "guest", isConnected: true, sessionName: "remover" }));
+	assertEq(reg.state.current.linkId, "remove02");
 
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: false,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "waiting" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: false,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "waiting" },
-	});
+	reg.removeLink("keep0001");
+	assertEq(reg.linksRegistry.size, 1);
+	assertEq(reg.state.current.linkId, "remove02", "active should not change when removing non-active");
+});
 
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
+test("removeLink unknown ID — no-op", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "exist001", mode: "host", isConnected: true, sessionName: "exists" }));
 
-	// Remove active (B) — no connected links, falls back to first available (A)
-	removeLink(registry, "bbb22222", active);
-	assertEq(active.current.linkId, "aaa11111", "should fall back to first available (A)");
+	reg.removeLink("nonexist");
+	assertEq(reg.linksRegistry.size, 1);
+	assertEq(reg.state.current.linkId, "exist001");
 });
 
 test("removeLink last link resets to initial state", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "last0001", mode: "host", isConnected: true, sessionName: "last" }));
+	reg.removeLink("last0001");
 
-	const link = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	addLink(registry, link, active);
-	removeLink(registry, "aaa11111", active);
-
-	assertEq(registry.size, 0);
-	assertEq(active.current.mode, "none");
-	assertEq(active.current.isConnected, false);
-	assertEq(active.current.linkId, "");
+	assertEq(reg.linksRegistry.size, 0);
+	assertEq(reg.state.current.mode, "none");
+	assertEq(reg.state.current.linkId, "");
 });
 
-test("get by registry.get returns correct link", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+console.log("\n  Target resolution:");
 
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
+test("resolveTargetLink undefined — returns active link", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "target01", mode: "host", isConnected: true, sessionName: "alpha" }));
 
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
-
-	const retrieved = registry.get("aaa11111");
-	assert(retrieved !== undefined, "should retrieve link by exact ID");
-	assertEq(retrieved!.meta.sessionName, "alpha");
-	assertEq(retrieved!.mode, "host");
-
-	const missing = registry.get("zzz99999");
-	assertEq(missing, undefined, "missing ID should return undefined");
+	const resolved = reg.resolveTargetLink(undefined);
+	assert(resolved !== undefined);
+	assertEq(resolved!.linkId, "target01");
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// 2. Target resolution by ID prefix, name, or index
-// ═══════════════════════════════════════════════════════════════════════════
-
-console.log("\nTarget resolution:");
-
-test("resolveTargetLink undefined target returns active link", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
-	active.mode = "host";
-	active.linkId = "aaa11111";
-	active.isConnected = true;
-
-	const result = resolveTargetLink(registry, active, undefined);
-	assert(result !== undefined, "should return active link");
-	assertEq(result!.linkId, "aaa11111");
+test("resolveTargetLink undefined — no active returns undefined", () => {
+	const reg = createRegistry();
+	assertEq(reg.resolveTargetLink(undefined), undefined);
 });
 
-test("resolveTargetLink undefined target returns undefined when no active link", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState(); // mode: "none"
+test("resolveTargetLink by ID prefix", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "aabbccdd", mode: "host", isConnected: true, sessionName: "full-id" }));
 
-	const result = resolveTargetLink(registry, active, undefined);
-	assertEq(result, undefined, "should return undefined when no active link");
+	const resolved = reg.resolveTargetLink("aabb");
+	assert(resolved !== undefined);
+	assertEq(resolved!.linkId, "aabbccdd");
 });
 
 test("resolveTargetLink by full ID", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
-	const link = makeLink({
-		linkId: "abc12345",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "target", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	registry.set(link.linkId, link);
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "aabbccdd", mode: "host", isConnected: true, sessionName: "full-id" }));
 
-	const result = resolveTargetLink(registry, active, "abc12345");
-	assert(result !== undefined);
-	assertEq(result!.linkId, "abc12345");
-});
-
-test("resolveTargetLink by ID prefix (shortest unique)", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
-
-	const linkA = makeLink({
-		linkId: "aaaa1111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbbb2222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
-
-	registry.set(linkA.linkId, linkA);
-	registry.set(linkB.linkId, linkB);
-
-	// "a" should match aaaa1111
-	const resultA = resolveTargetLink(registry, active, "a");
-	assert(resultA !== undefined, "should find link with prefix 'a'");
-	assertEq(resultA!.meta.sessionName, "alpha");
-
-	// "b" should match bbbb2222
-	const resultB = resolveTargetLink(registry, active, "b");
-	assert(resultB !== undefined, "should find link with prefix 'b'");
-	assertEq(resultB!.meta.sessionName, "beta");
-
-	// "aa" should still match aaaa1111
-	const resultAA = resolveTargetLink(registry, active, "aa");
-	assert(resultAA !== undefined);
-	assertEq(resultAA!.meta.sessionName, "alpha");
-});
-
-test("resolveTargetLink by ID prefix returns first match", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
-
-	const linkA = makeLink({
-		linkId: "ab111111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "first-ab", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "ab222222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "second-ab", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
-
-	registry.set(linkA.linkId, linkA);
-	registry.set(linkB.linkId, linkB);
-
-	// "ab" prefix matches both — should return first (insertion order)
-	const result = resolveTargetLink(registry, active, "ab");
-	assert(result !== undefined, "should find a match for prefix 'ab'");
-	assertEq(result!.meta.sessionName, "first-ab", "should return first match by insertion order");
+	assertEq(reg.resolveTargetLink("aabbccdd")?.linkId, "aabbccdd");
 });
 
 test("resolveTargetLink by session name", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "aa11bb22", mode: "host", isConnected: true, sessionName: "my-session" }));
 
-	const link = makeLink({
-		linkId: "zzz99999",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "my-special-session", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	registry.set(link.linkId, link);
-
-	// No ID prefix match — falls through to session name
-	const result = resolveTargetLink(registry, active, "my-special-session");
-	assert(result !== undefined);
-	assertEq(result!.linkId, "zzz99999");
+	assertEq(reg.resolveTargetLink("my-session")?.linkId, "aa11bb22");
 });
 
 test("resolveTargetLink by peer session name", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
+	const reg = createRegistry();
+	reg.addLink(makeLink({
+		linkId: "peer0011", mode: "guest", isConnected: true, sessionName: "this-session",
+		peerInfo: { sessionId: "peer-sess", sessionName: "peer-session", model: "peer/model" },
+	}));
 
-	const link = makeLink({
-		linkId: "zzz99999",
-		mode: "guest",
-		isConnected: true,
-		peerInfo: { sessionId: "peer-s1", sessionName: "remote-builder", model: "peer/m1" },
-		meta: { sessionName: "local-session", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	registry.set(link.linkId, link);
-
-	// No ID prefix or session name match — falls through to peer session name
-	const result = resolveTargetLink(registry, active, "remote-builder");
-	assert(result !== undefined);
-	assertEq(result!.linkId, "zzz99999");
+	assertEq(reg.resolveTargetLink("peer-session")?.linkId, "peer0011");
 });
 
-test("resolveTargetLink by numeric index", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
+test("resolveTargetLink by index", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "idx00001", mode: "host", isConnected: true, sessionName: "first" }));
+	reg.addLink(makeLink({ linkId: "idx00002", mode: "guest", isConnected: true, sessionName: "second" }));
+	reg.addLink(makeLink({ linkId: "idx00003", mode: "guest", isConnected: true, sessionName: "third" }));
 
-	const linkA = makeLink({
-		linkId: "first",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "link-zero", sessionId: "s0", model: "m0", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "second",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "link-one", sessionId: "s1", model: "m1", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
-	const linkC = makeLink({
-		linkId: "third",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "link-two", sessionId: "s2", model: "m2", created: 3, lastHeartbeat: 3, status: "connected" },
-	});
-
-	registry.set(linkA.linkId, linkA);
-	registry.set(linkB.linkId, linkB);
-	registry.set(linkC.linkId, linkC);
-
-	const result0 = resolveTargetLink(registry, active, "0");
-	assert(result0 !== undefined);
-	assertEq(result0!.meta.sessionName, "link-zero");
-
-	const result1 = resolveTargetLink(registry, active, "1");
-	assert(result1 !== undefined);
-	assertEq(result1!.meta.sessionName, "link-one");
-
-	const result2 = resolveTargetLink(registry, active, "2");
-	assert(result2 !== undefined);
-	assertEq(result2!.meta.sessionName, "link-two");
+	assertEq(reg.resolveTargetLink("0")?.linkId, "idx00001");
+	assertEq(reg.resolveTargetLink("1")?.linkId, "idx00002");
+	assertEq(reg.resolveTargetLink("2")?.linkId, "idx00003");
 });
 
-test("resolveTargetLink index out of bounds returns undefined", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
+test("resolveTargetLink by index — out of range returns undefined", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "only0001", mode: "host", isConnected: true, sessionName: "only" }));
 
-	const link = makeLink({
-		linkId: "only",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "solo", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	registry.set(link.linkId, link);
-
-	assertEq(resolveTargetLink(registry, active, "5"), undefined, "index 5 should be undefined");
-	assertEq(resolveTargetLink(registry, active, "-1"), undefined, "negative index should be undefined");
+	assertEq(reg.resolveTargetLink("5"), undefined);
 });
 
-test("resolveTargetLink no match returns undefined", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
+test("resolveTargetLink — unknown target returns undefined", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "exists01", mode: "host", isConnected: true, sessionName: "exists" }));
 
-	const link = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	registry.set(link.linkId, link);
-
-	assertEq(resolveTargetLink(registry, active, "nonexistent"), undefined);
-	assertEq(resolveTargetLink(registry, active, "zzz"), undefined);
+	assertEq(reg.resolveTargetLink("zzzzzzzz"), undefined);
+	assertEq(reg.resolveTargetLink("nonexistent-session"), undefined);
 });
 
-test("resolveTargetLink priority: ID prefix > session name > peer name > index", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
+test("resolveTargetLink — ID prefix takes priority over index", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "0aaaaaaa", mode: "host", isConnected: true, sessionName: "zero-prefix" }));
+	reg.addLink(makeLink({ linkId: "1bbbbbbb", mode: "guest", isConnected: true, sessionName: "one-name" }));
 
-	// Create a link whose ID starts with "0" and whose session name is "1"
-	const link = makeLink({
-		linkId: "0abc1234",
-		mode: "host",
-		isConnected: true,
-		peerInfo: { sessionId: "p1", sessionName: "2", model: "pm" },
-		meta: { sessionName: "1", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	registry.set(link.linkId, link);
-
-	// "0" matches ID prefix — should take priority over index 0
-	const result = resolveTargetLink(registry, active, "0");
-	assert(result !== undefined);
-	assertEq(result!.linkId, "0abc1234", "ID prefix '0' should match, not index 0");
+	const resolved = reg.resolveTargetLink("0");
+	assert(resolved !== undefined);
+	assertEq(resolved!.linkId, "0aaaaaaa", "ID prefix should take priority over index");
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// 3. Multiple simultaneous links don't interfere
-// ═══════════════════════════════════════════════════════════════════════════
+console.log("\n  /link list output parsing:");
 
-console.log("\nMulti-link isolation:");
+test("list output format — single link shows active marker and transport", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "list0001", mode: "host", isConnected: true, sessionName: "alpha" }));
 
-test("modifying one link's meta does not affect others", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
-
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
-
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
-
-	// Mutate linkA's meta
-	registry.get("aaa11111")!.meta.sessionName = "alpha-modified";
-	registry.get("aaa11111")!.isConnected = false;
-
-	// linkB should be unaffected
-	const b = registry.get("bbb22222")!;
-	assertEq(b.meta.sessionName, "beta", "B's session name should be unchanged");
-	assertEq(b.isConnected, true, "B's connection state should be unchanged");
-	assertEq(b.mode, "guest", "B's mode should be unchanged");
-});
-
-test("removing one link does not affect the other", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
-
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
-
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
-
-	// Remove A
-	removeLink(registry, "aaa11111", active);
-
-	// B should still be intact
-	const b = registry.get("bbb22222");
-	assert(b !== undefined, "B should still exist in registry");
-	assertEq(b!.meta.sessionName, "beta");
-	assertEq(b!.isConnected, true);
-	assertEq(b!.linkId, "bbb22222");
-});
-
-test("resolveTargetLink picks correct link among many", () => {
-	const registry = new Map<string, LinkState>();
-	const active = createInitialState();
-
-	const links = [
-		makeLink({ linkId: "link0001", mode: "host", isConnected: true, meta: { sessionName: "dev", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" } }),
-		makeLink({ linkId: "link0002", mode: "guest", isConnected: true, meta: { sessionName: "build", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" } }),
-		makeLink({ linkId: "link0003", mode: "guest", isConnected: true, meta: { sessionName: "test", sessionId: "s3", model: "m3", created: 3, lastHeartbeat: 3, status: "connected" } }),
-		makeLink({ linkId: "link0004", mode: "guest", isConnected: false, meta: { sessionName: "monitor", sessionId: "s4", model: "m4", created: 4, lastHeartbeat: 4, status: "waiting" } }),
-	];
-
-	for (const link of links) {
-		registry.set(link.linkId, link);
+	const lines: string[] = [];
+	let i = 0;
+	for (const [id, link] of reg.linksRegistry) {
+		const isActive = id === reg.state.current.linkId;
+		const prefix = isActive ? "→ " : "  ";
+		const transport = link.transport === "http" ? " [HTTP]" : " [UDS]";
+		const connStatus = link.isConnected ? "🟢 connected" : "🔴 disconnected";
+		lines.push(`${prefix}[${i}] ${link.meta.sessionName}${transport} ${connStatus} (${id.slice(0, 8)})`);
+		i++;
 	}
 
-	// Resolve by session name
-	assertEq(resolveTargetLink(registry, active, "dev")!.linkId, "link0001");
-	assertEq(resolveTargetLink(registry, active, "build")!.linkId, "link0002");
-	assertEq(resolveTargetLink(registry, active, "test")!.linkId, "link0003");
-	assertEq(resolveTargetLink(registry, active, "monitor")!.linkId, "link0004");
-
-	// Resolve by index
-	assertEq(resolveTargetLink(registry, active, "0")!.linkId, "link0001");
-	assertEq(resolveTargetLink(registry, active, "3")!.linkId, "link0004");
-
-	// Resolve by ID prefix
-	assertEq(resolveTargetLink(registry, active, "link0")!.linkId, "link0001");
-	assertEq(resolveTargetLink(registry, active, "link0003")!.linkId, "link0003");
+	assertEq(lines.length, 1);
+	assert(lines[0].startsWith("→ "), "active link should have → prefix");
+	assert(lines[0].includes("[0]"), "should have index");
+	assert(lines[0].includes("alpha"), "should have session name");
+	assert(lines[0].includes("[UDS]"), "should have transport");
+	assert(lines[0].includes("🟢 connected"), "should have connection status");
+	assert(lines[0].includes("list0001"), "should have link ID prefix");
 });
 
-test("each link has independent resolveQueue", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+test("list output format — multiple links with active marker", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "multi001", mode: "host", isConnected: true, sessionName: "first" }));
+	reg.addLink(makeLink({ linkId: "multi002", mode: "guest", isConnected: true, sessionName: "second" }));
 
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
+	const lines: string[] = [];
+	let i = 0;
+	for (const [id, link] of reg.linksRegistry) {
+		const isActive = id === reg.state.current.linkId;
+		const prefix = isActive ? "→ " : "  ";
+		lines.push(`${prefix}[${i}] ${link.meta.sessionName} [UDS] ${link.isConnected ? "🟢 connected" : "🔴 disconnected"} (${id.slice(0, 8)})`);
+		i++;
+	}
 
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
+	assertEq(lines.length, 2);
+	assert(lines[0].startsWith("  "), "first should not be active");
+	assert(lines[1].startsWith("→ "), "second should be active");
+});
 
-	// Add entries to each queue
+test("list output — HTTP transport shown", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "http0001", mode: "host", transport: "http", isConnected: true, sessionName: "remote" }));
+
+	let output = "";
+	for (const [, link] of reg.linksRegistry) {
+		output += link.transport === "http" ? " [HTTP]" : " [UDS]";
+	}
+	assert(output.includes("[HTTP]"), "should show HTTP transport");
+});
+
+test("list output — index is parseable for /link disconnect", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "parse001", mode: "host", isConnected: true, sessionName: "alpha" }));
+	reg.addLink(makeLink({ linkId: "parse002", mode: "guest", isConnected: true, sessionName: "beta" }));
+
+	const listLine = "  [1] beta [UDS] 🟢 connected (parse002)";
+	const indexMatch = listLine.match(/\[(\d+)\]/);
+	assert(indexMatch !== null, "should extract index from list output");
+	assertEq(parseInt(indexMatch![1], 10), 1);
+	const links = [...reg.linksRegistry.values()];
+	assertEq(links[1]?.linkId, "parse002", "index should resolve to correct link");
+});
+
+test("multi-link isolation — modifying one link does not affect others", () => {
+	const reg = createRegistry();
+	reg.addLink(makeLink({ linkId: "iso00001", mode: "host", isConnected: true, sessionName: "alpha" }));
+	reg.addLink(makeLink({ linkId: "iso00002", mode: "guest", isConnected: true, sessionName: "beta" }));
+
+	reg.linksRegistry.get("iso00001")!.meta.sessionName = "alpha-modified";
+	reg.linksRegistry.get("iso00001")!.isConnected = false;
+
+	const b = reg.linksRegistry.get("iso00002")!;
+	assertEq(b.meta.sessionName, "beta", "B should be unchanged");
+	assertEq(b.isConnected, true, "B connection state should be unchanged");
+});
+
+test("multi-link isolation — each link has independent resolveQueue", () => {
+	const reg = createRegistry();
+	const linkA = makeLink({ linkId: "qa000001", mode: "host", isConnected: true, sessionName: "alpha" });
+	const linkB = makeLink({ linkId: "qa000002", mode: "guest", isConnected: true, sessionName: "beta" });
+	reg.addLink(linkA);
+	reg.addLink(linkB);
+
 	linkA.resolveQueue.set("req-a1", () => {});
 	linkA.resolveQueue.set("req-a2", () => {});
 	linkB.resolveQueue.set("req-b1", () => {});
 
-	assertEq(linkA.resolveQueue.size, 2, "A should have 2 queued items");
-	assertEq(linkB.resolveQueue.size, 1, "B should have 1 queued item");
-
-	// Clear A's queue
+	assertEq(linkA.resolveQueue.size, 2);
+	assertEq(linkB.resolveQueue.size, 1);
 	linkA.resolveQueue.clear();
-	assertEq(linkA.resolveQueue.size, 0, "A's queue should be empty");
+	assertEq(linkA.resolveQueue.size, 0);
 	assertEq(linkB.resolveQueue.size, 1, "B's queue should be unaffected");
 });
 
-test("each link has independent buffer", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+test("multi-link isolation — each link has independent buffer", () => {
+	const reg = createRegistry();
+	const linkA = makeLink({ linkId: "buf00001", mode: "host", isConnected: true, sessionName: "alpha" });
+	const linkB = makeLink({ linkId: "buf00002", mode: "guest", isConnected: true, sessionName: "beta" });
+	reg.addLink(linkA);
+	reg.addLink(linkB);
 
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
+	linkA.buffer = "data-from-alpha";
+	linkB.buffer = "data-from-beta";
 
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
-
-	linkA.buffer = "partial-data-from-alpha";
-	linkB.buffer = "partial-data-from-beta";
-
-	assert(linkA.buffer.includes("alpha"), "A's buffer should contain alpha data");
-	assert(linkB.buffer.includes("beta"), "B's buffer should contain beta data");
-	assert(!linkA.buffer.includes("beta"), "A's buffer should NOT contain beta data");
-	assert(!linkB.buffer.includes("alpha"), "B's buffer should NOT contain alpha data");
+	assert(linkA.buffer.includes("alpha"));
+	assert(linkB.buffer.includes("beta"));
+	assert(!linkA.buffer.includes("beta"));
+	assert(!linkB.buffer.includes("alpha"));
 });
 
-test("active link switching preserves all link state", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+// ═══════════════════════════════════════════════════════════════════════════
+// 2. STREAMING (8jk) — chunk delivery, assembly, completion/cleanup
+// ═══════════════════════════════════════════════════════════════════════════
 
-	const linkA = makeLink({
-		linkId: "aaa11111",
-		mode: "host",
-		isConnected: true,
-		peerInfo: { sessionId: "p1", sessionName: "peer-a", model: "pm1" },
-		meta: { sessionName: "alpha", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" },
-	});
-	const linkB = makeLink({
-		linkId: "bbb22222",
-		mode: "guest",
-		isConnected: true,
-		peerInfo: { sessionId: "p2", sessionName: "peer-b", model: "pm2" },
-		meta: { sessionName: "beta", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" },
-	});
+console.log("\n── Streaming (8jk) ──");
 
-	addLink(registry, linkA, active);
-	addLink(registry, linkB, active);
+console.log("\n  task/stream JSON-RPC notifications:");
 
-	// Both links should retain their full state
-	const a = registry.get("aaa11111")!;
-	const b = registry.get("bbb22222")!;
-
-	assertEq(a.mode, "host");
-	assertEq(a.peerInfo?.sessionName, "peer-a");
-	assertEq(a.meta.model, "m1");
-
-	assertEq(b.mode, "guest");
-	assertEq(b.peerInfo?.sessionName, "peer-b");
-	assertEq(b.meta.model, "m2");
+test("task/stream message has correct structure for chunk", () => {
+	const taskId = generateId();
+	const msg = createJsonRpc("task/stream", { taskId, chunk: "Hello ", done: false });
+	assertEq(msg.jsonrpc, "2.0");
+	assertEq(msg.method, "task/stream");
+	assertEq((msg.params as any).taskId, taskId);
+	assertEq((msg.params as any).chunk, "Hello ");
+	assertEq((msg.params as any).done, false);
 });
 
-test("removeAll clears everything", () => {
-	const registry = new Map<string, LinkState>();
-	const active = { current: createInitialState() };
+test("task/stream message has correct structure for done", () => {
+	const taskId = generateId();
+	const msg = createJsonRpc("task/stream", { taskId, chunk: "", done: true });
+	assertEq(msg.method, "task/stream");
+	assertEq((msg.params as any).done, true);
+	assertEq((msg.params as any).chunk, "");
+});
 
-	const links = [
-		makeLink({ linkId: "a", mode: "host", isConnected: true, meta: { sessionName: "x", sessionId: "s1", model: "m1", created: 1, lastHeartbeat: 1, status: "connected" } }),
-		makeLink({ linkId: "b", mode: "guest", isConnected: true, meta: { sessionName: "y", sessionId: "s2", model: "m2", created: 2, lastHeartbeat: 2, status: "connected" } }),
-		makeLink({ linkId: "c", mode: "guest", isConnected: false, meta: { sessionName: "z", sessionId: "s3", model: "m3", created: 3, lastHeartbeat: 3, status: "waiting" } }),
+test("task/stream chunk is a method call (not a result)", () => {
+	const msg = createJsonRpc("task/stream", { taskId: "abc", chunk: "data", done: false });
+	assert(msg.id.length > 0, "should have id");
+	assert(msg.method === "task/stream", "should be a method call");
+	assert(msg.result === undefined, "should not have result");
+});
+
+console.log("\n  Chunk assembly in streamBuffers:");
+
+test("chunks accumulate in buffer", () => {
+	const streamBuffers = new Map<string, string>();
+	const taskId = "accum01";
+
+	streamBuffers.set(taskId, "");
+	streamBuffers.set(taskId, (streamBuffers.get(taskId) ?? "") + "Hello ");
+	streamBuffers.set(taskId, (streamBuffers.get(taskId) ?? "") + "World");
+
+	assertEq(streamBuffers.get(taskId), "Hello World");
+});
+
+test("multiple tasks have independent buffers", () => {
+	const streamBuffers = new Map<string, string>();
+	streamBuffers.set("task_aaa", "alpha");
+	streamBuffers.set("task_bbb", "beta");
+	streamBuffers.set("task_aaa", (streamBuffers.get("task_aaa") ?? "") + " modified");
+
+	assertEq(streamBuffers.get("task_aaa"), "alpha modified");
+	assertEq(streamBuffers.get("task_bbb"), "beta");
+});
+
+test("chunk assembly from parsed UDS messages", () => {
+	const streamBuffers = new Map<string, string>();
+	const taskId = "asm001";
+	const msg1 = createJsonRpc("task/stream", { taskId, chunk: "line1\n", done: false });
+	const msg2 = createJsonRpc("task/stream", { taskId, chunk: "line2\n", done: false });
+	const msg3 = createJsonRpc("task/stream", { taskId, chunk: "line3", done: false });
+
+	const raw = JSON.stringify(msg1) + "\n" + JSON.stringify(msg2) + "\n" + JSON.stringify(msg3) + "\n";
+	const { messages } = parseJsonRpcLines(raw);
+	assertEq(messages.length, 3);
+
+	for (const msg of messages) {
+		if (msg.method === "task/stream") {
+			const p = msg.params as { taskId: string; chunk: string; done: boolean };
+			if (p.chunk && !p.done) {
+				streamBuffers.set(p.taskId, (streamBuffers.get(p.taskId) ?? "") + p.chunk);
+			}
+		}
+	}
+
+	assertEq(streamBuffers.get(taskId), "line1\nline2\nline3");
+});
+
+test("chunk assembly handles interleaved tasks", () => {
+	const streamBuffers = new Map<string, string>();
+	const taskA = "interA";
+	const taskB = "interB";
+
+	const msgs = [
+		createJsonRpc("task/stream", { taskId: taskA, chunk: "A1 ", done: false }),
+		createJsonRpc("task/stream", { taskId: taskB, chunk: "B1 ", done: false }),
+		createJsonRpc("task/stream", { taskId: taskA, chunk: "A2", done: false }),
+		createJsonRpc("task/stream", { taskId: taskB, chunk: "B2", done: false }),
 	];
 
-	for (const link of links) addLink(registry, link, active);
+	const raw = msgs.map((m) => JSON.stringify(m)).join("\n") + "\n";
+	const { messages } = parseJsonRpcLines(raw);
 
-	// Simulate cleanupAll
-	registry.clear();
-	active.current = createInitialState();
+	for (const msg of messages) {
+		if (msg.method === "task/stream") {
+			const p = msg.params as { taskId: string; chunk: string; done: boolean };
+			if (p.chunk && !p.done) {
+				streamBuffers.set(p.taskId, (streamBuffers.get(p.taskId) ?? "") + p.chunk);
+			}
+		}
+	}
 
-	assertEq(registry.size, 0);
-	assertEq(active.current.mode, "none");
-	assertEq(active.current.linkId, "");
+	assertEq(streamBuffers.get(taskA), "A1 A2");
+	assertEq(streamBuffers.get(taskB), "B1 B2");
 });
 
-// ═══════════════════════════════════════════════════════════════════════════
-// 4. Streaming: task/stream notification parsing
-// ═══════════════════════════════════════════════════════════════════════════
+console.log("\n  Stream completion and cleanup:");
 
-console.log("\nStreaming: task/stream notification parsing:");
+test("done=true removes task from streamBuffers", () => {
+	const streamBuffers = new Map<string, string>();
+	streamBuffers.set("done001", "accumulated content");
+	assertEq(streamBuffers.size, 1);
 
-// Replicate the stream buffer logic from index.ts
-function createStreamBuffers(): Map<string, string> {
-	return new Map<string, string>();
-}
+	streamBuffers.delete("done001");
+	assertEq(streamBuffers.size, 0);
+	assertEq(streamBuffers.get("done001"), undefined);
+});
 
-/**
- * Replicate the stream chunk processing from index.ts.
- * Returns { assembled: string | null, bufferCleared: boolean }
- */
-function processStreamNotification(
-	msg: { method?: string; params?: Record<string, unknown> },
-	streamBuffers: Map<string, string>,
-): { assembled: string | null; bufferCleared: boolean } {
-	if (msg.method !== "task/stream") return { assembled: null, bufferCleared: false };
+test("streamBuffers empty after all tasks complete — widget cleared", () => {
+	const streamBuffers = new Map<string, string>();
+	streamBuffers.set("task1", "content1");
+	streamBuffers.set("task2", "content2");
 
-	const p = msg.params as { taskId?: string; chunk?: string; done?: boolean } | undefined;
-	if (!p || !p.taskId) return { assembled: null, bufferCleared: false };
+	streamBuffers.delete("task1");
+	streamBuffers.delete("task2");
 
+	assertEq(streamBuffers.size, 0);
+	// When streamBuffers.size === 0: ctx?.ui.setWidget("link-stream", undefined)
+});
+
+test("done=true ignores chunk field — only done flag matters", () => {
+	const streamBuffers = new Map<string, string>();
+	streamBuffers.set("done002", "existing content");
+
+	const p = { taskId: "done002", chunk: "ignored", done: true };
 	if (p.done) {
 		streamBuffers.delete(p.taskId);
-		return { assembled: null, bufferCleared: true };
+	} else if (p.chunk) {
+		streamBuffers.set(p.taskId, (streamBuffers.get(p.taskId) ?? "") + p.chunk);
 	}
 
-	if (p.chunk) {
-		const existing = streamBuffers.get(p.taskId) ?? "";
-		streamBuffers.set(p.taskId, existing + p.chunk);
-	}
+	assertEq(streamBuffers.get("done002"), undefined, "buffer should be deleted on done");
+});
 
-	return { assembled: streamBuffers.get(p.taskId) ?? null, bufferCleared: false };
+test("stream preview truncation logic (>300 chars)", () => {
+	const content = "A".repeat(400);
+	const preview = content.length > 300 ? "..." + content.slice(-300) : content;
+	assertEq(preview.length, 303, "should be '...' + 300 chars");
+	assert(preview.startsWith("..."), "should start with ...");
+});
+
+test("stream preview for short content", () => {
+	const content = "short";
+	const preview = content.length > 300 ? "..." + content.slice(-300) : content;
+	assertEq(preview, "short");
+});
+
+test("stream preview shows last 3 lines", () => {
+	const content = "line1\nline2\nline3\nline4\nline5";
+	const last3 = content.split("\n").slice(-3).join("\n");
+	assertEq(last3, "line3\nline4\nline5");
+});
+
+test("UDS transport delivers stream chunks and done signal", () => {
+	const sockPath = path.join(os.tmpdir(), `__test_stream_${crypto.randomBytes(4).toString("hex")}.sock`);
+	const taskId = generateId();
+
+	return new Promise<void>((resolve, reject) => {
+		const server = net.createServer((socket) => {
+			socket.on("data", (data) => {
+				const { messages } = parseJsonRpcLines(data.toString());
+				for (const msg of messages) {
+					if (msg.method === "task/stream") {
+						sendJsonRpc(socket, msg); // echo back
+					}
+				}
+			});
+		});
+
+		server.listen(sockPath, () => {
+			const client = new net.Socket();
+			client.connect(sockPath, () => {
+				sendJsonRpc(client, createJsonRpc("task/stream", { taskId, chunk: "chunk1 ", done: false }));
+				sendJsonRpc(client, createJsonRpc("task/stream", { taskId, chunk: "chunk2 ", done: false }));
+				sendJsonRpc(client, createJsonRpc("task/stream", { taskId, chunk: "", done: true }));
+
+				const streamBuffers = new Map<string, string>();
+				let doneReceived = false;
+				let buf = "";
+
+				client.on("data", (data) => {
+					buf += data.toString();
+					const { messages, remaining } = parseJsonRpcLines(buf);
+					buf = remaining;
+
+					for (const msg of messages) {
+						if (msg.method === "task/stream") {
+							const p = msg.params as { taskId: string; chunk: string; done: boolean };
+							if (p.done) {
+								doneReceived = true;
+								streamBuffers.delete(p.taskId);
+							} else if (p.chunk) {
+								streamBuffers.set(p.taskId, (streamBuffers.get(p.taskId) ?? "") + p.chunk);
+							}
+						}
+					}
+
+					if (doneReceived && streamBuffers.size === 0) {
+						client.destroy();
+						server.close();
+						try { fs.unlinkSync(sockPath); } catch { /* ignore */ }
+						resolve();
+					}
+				});
+			});
+			client.on("error", reject);
+		});
+		server.on("error", reject);
+
+		setTimeout(() => {
+			client.destroy();
+			server.close();
+			try { fs.unlinkSync(sockPath); } catch { /* ignore */ }
+			reject(new Error("stream test timed out"));
+		}, 5000);
+	});
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. HTTP ADAPTER (b6e) — auth, RPC, discovery, health, UDS fallback
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log("\n── HTTP Adapter (b6e) ──");
+
+console.log("\n  Bearer token auth:");
+
+test("valid token — returns 200", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode, body } = await httpGet(`http://127.0.0.1:${port}/health`, {
+		Authorization: `Bearer ${testSecret}`,
+	});
+
+	assertEq(statusCode, 200);
+	assertEq(JSON.parse(body).status, "ok");
+	srv.close();
+});
+
+test("missing token — returns 401", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode, body } = await httpGet(`http://127.0.0.1:${port}/health`);
+
+	assertEq(statusCode, 401);
+	assertEq(JSON.parse(body).error.code, 401);
+	assertEq(JSON.parse(body).error.message, "Unauthorized");
+	srv.close();
+});
+
+test("wrong token — returns 401", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode, body } = await httpGet(`http://127.0.0.1:${port}/health`, {
+		Authorization: "Bearer wrong-secret",
+	});
+
+	assertEq(statusCode, 401);
+	assertEq(JSON.parse(body).error.code, 401);
+	srv.close();
+});
+
+test("malformed auth header (Basic instead of Bearer) — returns 401", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode } = await httpGet(`http://127.0.0.1:${port}/health`, {
+		Authorization: "Basic dXNlcjpwYXNz",
+	});
+
+	assertEq(statusCode, 401);
+	srv.close();
+});
+
+test("CORS preflight (OPTIONS) — no auth required", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode } = await new Promise<{ statusCode: number }>((resolve, reject) => {
+		const r = http.request(`http://127.0.0.1:${port}/rpc`, { method: "OPTIONS", timeout: 3000 }, (res) => {
+			resolve({ statusCode: res.statusCode ?? 0 });
+			res.resume();
+		});
+		r.on("error", reject);
+		r.on("timeout", () => { r.destroy(); reject(new Error("timeout")); });
+		r.end();
+	});
+
+	assertEq(statusCode, 204, "OPTIONS should return 204 without auth");
+	srv.close();
+});
+
+console.log("\n  /rpc endpoint task delivery:");
+
+test("ping via /rpc returns session info", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const pingMsg = createJsonRpc("ping", { sessionId: "caller-sess", sessionName: "caller" });
+	const { statusCode, resBody } = await httpPost(
+		`http://127.0.0.1:${port}/rpc`,
+		JSON.stringify(pingMsg),
+		{ "Content-Type": "application/json", Authorization: `Bearer ${testSecret}` },
+	);
+
+	assertEq(statusCode, 200);
+	const parsed = JSON.parse(resBody);
+	assertEq(parsed.jsonrpc, "2.0");
+	assertEq(parsed.id, pingMsg.id, "response id should match request");
+	assertEq(parsed.result.sessionName, "http-test-session");
+	assertEq(parsed.result.model, "test/model");
+	srv.close();
+});
+
+test("task/send via /rpc with valid prompt returns received", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const taskId = generateId();
+	const taskMsg = createJsonRpc("task/send", { taskId, prompt: "Do something", mode: "silent", replyTo: "sender" });
+	const { statusCode, resBody } = await httpPost(
+		`http://127.0.0.1:${port}/rpc`,
+		JSON.stringify(taskMsg),
+		{ "Content-Type": "application/json", Authorization: `Bearer ${testSecret}` },
+	);
+
+	assertEq(statusCode, 200);
+	const parsed = JSON.parse(resBody);
+	assertEq(parsed.result.taskId, taskId);
+	assertEq(parsed.result.status, "received");
+	assertEq(parsed.result.mode, "silent");
+	srv.close();
+});
+
+test("task/send via /rpc with visible mode", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const taskMsg = createJsonRpc("task/send", { taskId: generateId(), prompt: "Visible task", mode: "visible" });
+	const { statusCode, resBody } = await httpPost(
+		`http://127.0.0.1:${port}/rpc`,
+		JSON.stringify(taskMsg),
+		{ "Content-Type": "application/json", Authorization: `Bearer ${testSecret}` },
+	);
+
+	assertEq(statusCode, 200);
+	assertEq(JSON.parse(resBody).result.mode, "visible");
+	srv.close();
+});
+
+test("task/send via /rpc missing prompt returns error", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const taskMsg = createJsonRpc("task/send", { taskId: generateId() }); // no prompt
+	const { statusCode, resBody } = await httpPost(
+		`http://127.0.0.1:${port}/rpc`,
+		JSON.stringify(taskMsg),
+		{ "Content-Type": "application/json", Authorization: `Bearer ${testSecret}` },
+	);
+
+	assertEq(statusCode, 200);
+	const parsed = JSON.parse(resBody);
+	assertEq(parsed.error.code, -32602);
+	assert(parsed.error.message.includes("Missing prompt"));
+	srv.close();
+});
+
+test("unknown method via /rpc returns Method not found", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const msg = createJsonRpc("nonexistent/method", {});
+	const { statusCode, resBody } = await httpPost(
+		`http://127.0.0.1:${port}/rpc`,
+		JSON.stringify(msg),
+		{ "Content-Type": "application/json", Authorization: `Bearer ${testSecret}` },
+	);
+
+	assertEq(statusCode, 200);
+	assertEq(JSON.parse(resBody).error.code, -32601);
+	assertEq(JSON.parse(resBody).error.message, "Method not found");
+	srv.close();
+});
+
+test("malformed JSON via /rpc returns 500", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode, resBody } = await httpPost(
+		`http://127.0.0.1:${port}/rpc`,
+		"not json at all",
+		{ "Content-Type": "application/json", Authorization: `Bearer ${testSecret}` },
+	);
+
+	assertEq(statusCode, 500);
+	assertEq(JSON.parse(resBody).error.code, -32603);
+	srv.close();
+});
+
+console.log("\n  /.well-known/agent.json discovery:");
+
+test("agent.json returns correct structure", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode, body } = await httpGet(`http://127.0.0.1:${port}/.well-known/agent.json`, {
+		Authorization: `Bearer ${testSecret}`,
+	});
+
+	assertEq(statusCode, 200);
+	const card = JSON.parse(body);
+	assertEq(card.name, "http-test-session");
+	assertEq(card.model, "test/model");
+	assertEq(card.sessionId, testLink.meta.sessionId);
+	assertEq(card.protocol, "pi-link");
+	assertEq(card.version, "v0.2.0");
+	assert(Array.isArray(card.skills), "skills should be array");
+	assert(card.skills.includes("task/send"));
+	assert(card.skills.includes("ping"));
+	srv.close();
+});
+
+test("agent.json requires auth", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode } = await httpGet(`http://127.0.0.1:${port}/.well-known/agent.json`);
+	assertEq(statusCode, 401);
+	srv.close();
+});
+
+console.log("\n  Health endpoint:");
+
+test("/health returns ok status", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode, body } = await httpGet(`http://127.0.0.1:${port}/health`, {
+		Authorization: `Bearer ${testSecret}`,
+	});
+
+	assertEq(statusCode, 200);
+	const parsed = JSON.parse(body);
+	assertEq(parsed.status, "ok");
+	assertEq(parsed.session, "http-test-session");
+	assertEq(parsed.transport, "http");
+	srv.close();
+});
+
+test("/health requires auth", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode } = await httpGet(`http://127.0.0.1:${port}/health`);
+	assertEq(statusCode, 401);
+	srv.close();
+});
+
+test("unknown endpoint returns 404 (with auth)", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode } = await httpGet(`http://127.0.0.1:${port}/unknown`, {
+		Authorization: `Bearer ${testSecret}`,
+	});
+	assertEq(statusCode, 404);
+	srv.close();
+});
+
+test("unknown endpoint returns 401 (without auth — auth checked before routing)", async () => {
+	const port = await getFreePort();
+	const srv = await createTestHttpServer(testLink, testSecret, port);
+
+	const { statusCode } = await httpGet(`http://127.0.0.1:${port}/unknown`);
+	assertEq(statusCode, 401);
+	srv.close();
+});
+
+console.log("\n  UDS fallback / httpPostRpc utility:");
+
+test("httpPostRpc sends correct headers and hits /rpc", async () => {
+	const port = await getFreePort();
+
+	const srv = await new Promise<http.Server>((resolve, reject) => {
+		const server = http.createServer((req, res) => {
+			let body = "";
+			req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+			req.on("end", () => {
+				const parsed = JSON.parse(body) as JsonRpcMessage;
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({
+					jsonrpc: "2.0", id: parsed.id,
+					result: {
+						auth: req.headers["authorization"],
+						contentType: req.headers["content-type"],
+						method: req.method,
+						url: req.url,
+					},
+				}));
+			});
+		});
+		server.listen(port, "127.0.0.1", () => resolve(server));
+		server.on("error", reject);
+	});
+
+	const msg = createJsonRpc("ping", {});
+	const result = await httpPostRpc(`http://127.0.0.1:${port}`, testSecret, msg, 5000);
+
+	assertEq(result.result?.auth, `Bearer ${testSecret}`, "should send Bearer token");
+	assertEq(result.result?.contentType, "application/json", "should send Content-Type");
+	assertEq(result.result?.method, "POST", "should be POST");
+	assertEq(result.result?.url, "/rpc", "should hit /rpc endpoint");
+	srv.close();
+});
+
+test("httpPostRpc strips trailing slash from baseUrl", async () => {
+	const port = await getFreePort();
+
+	const srv = await new Promise<http.Server>((resolve, reject) => {
+		const server = http.createServer((req, res) => {
+			let body = "";
+			req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+			req.on("end", () => {
+				const parsed = JSON.parse(body) as JsonRpcMessage;
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { url: req.url } }));
+			});
+		});
+		server.listen(port, "127.0.0.1", () => resolve(server));
+		server.on("error", reject);
+	});
+
+	const msg = createJsonRpc("ping", {});
+	const result = await httpPostRpc(`http://127.0.0.1:${port}/`, testSecret, msg, 5000);
+	assertEq(result.result?.url, "/rpc", "trailing slash should be stripped");
+	srv.close();
+});
+
+test("httpPostRpc rejects on connection refused", async () => {
+	const msg = createJsonRpc("ping", {});
+	try {
+		await httpPostRpc("http://127.0.0.1:1", testSecret, msg, 2000);
+		throw new Error("should have rejected");
+	} catch (err: any) {
+		assert(err.message.includes("ECONNREFUSED") || err.message.includes("connect"), `should be connection error: ${err.message}`);
+	}
+});
+
+test("httpPostRpc rejects on timeout", async () => {
+	const port = await getFreePort();
+
+	const srv = await new Promise<http.Server>((resolve, reject) => {
+		const server = http.createServer(() => { /* never respond */ });
+		server.listen(port, "127.0.0.1", () => resolve(server));
+		server.on("error", reject);
+	});
+
+	const msg = createJsonRpc("ping", {});
+	try {
+		await httpPostRpc(`http://127.0.0.1:${port}`, testSecret, msg, 500);
+		throw new Error("should have timed out");
+	} catch (err: any) {
+		assert(err.message.includes("timed out"), `should be timeout: ${err.message}`);
+	}
+	srv.close();
+});
+
+console.log("\n  Shared secret helpers:");
+
+test("ensureLinkSecret uses env var when set", () => {
+	const originalSecret = process.env.PI_LINK_SECRET;
+	const testVal = `env-secret-${crypto.randomBytes(4).toString("hex")}`;
+	process.env.PI_LINK_SECRET = testVal;
+
+	try {
+		assertEq(ensureLinkSecret(), testVal, "should use env secret when set");
+	} finally {
+		if (originalSecret === undefined) delete process.env.PI_LINK_SECRET;
+		else process.env.PI_LINK_SECRET = originalSecret;
+	}
+});
+
+test("ensureLinkSecret creates persistent secret when env not set", () => {
+	const originalSecret = process.env.PI_LINK_SECRET;
+	delete process.env.PI_LINK_SECRET;
+
+	const secretFile = path.join(os.tmpdir(), `__test_pi_link_secret_${crypto.randomBytes(4).toString("hex")}`);
+	const originalSecretFile = process.env.PI_LINK_SECRET_FILE;
+
+	// We can't easily override the constant path, but we can test that
+	// ensureLinkSecret returns a non-empty string
+	try {
+		// This will use the real file path — just verify it returns something
+		const secret = ensureLinkSecret();
+		assert(secret.length > 0, "should return a non-empty secret");
+		assert(/^[0-9a-f]+$/.test(secret), "secret should be hex");
+	} finally {
+		if (originalSecret !== undefined) process.env.PI_LINK_SECRET = originalSecret;
+	}
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. HTTP Adapter: Bearer token auth
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log("\nHTTP Adapter: Bearer token auth:");
+
+// Replicate the auth check from startHttpAdapter in index.ts
+function checkBearerAuth(
+	authHeader: string | undefined,
+	secret: string,
+): { authorized: boolean; response?: { status: number; body: Record<string, unknown> } } {
+	if (authHeader !== `Bearer ${secret}`) {
+		return {
+			authorized: false,
+			response: {
+				status: 401,
+				body: { jsonrpc: "2.0", error: { code: 401, message: "Unauthorized" }, id: null },
+			},
+		};
+	}
+	return { authorized: true };
 }
 
-test("non-stream message is ignored", () => {
-	const buffers = createStreamBuffers();
-	const result = processStreamNotification({ method: "task/result", params: { taskId: "t1" } }, buffers);
-	assertEq(result.assembled, null);
-	assertEq(result.bufferCleared, false);
-	assertEq(buffers.size, 0);
+test("valid Bearer token is accepted", () => {
+	const secret = "my-secret-key-123";
+	const result = checkBearerAuth(`Bearer ${secret}`, secret);
+	assert(result.authorized, "should be authorized with valid token");
+	assertEq(result.response, undefined, "should not have error response");
 });
 
-test("stream notification with chunk appends to buffer", () => {
-	const buffers = createStreamBuffers();
-	const result = processStreamNotification(
-		{ method: "task/stream", params: { taskId: "t1", chunk: "Hello ", done: false } },
-		buffers,
-	);
-	assertEq(result.assembled, "Hello ");
-	assertEq(result.bufferCleared, false);
-	assertEq(buffers.get("t1"), "Hello ");
+test("missing Authorization header is rejected", () => {
+	const result = checkBearerAuth(undefined, "my-secret-key-123");
+	assert(!result.authorized, "should be unauthorized");
+	assertEq(result.response!.status, 401);
+	assertEq(result.response!.body.error.code, 401);
+	assertEq(result.response!.body.error.message, "Unauthorized");
 });
 
-test("stream notification without params is ignored", () => {
-	const buffers = createStreamBuffers();
-	const result = processStreamNotification({ method: "task/stream" }, buffers);
-	assertEq(result.assembled, null);
-	assertEq(result.bufferCleared, false);
-	assertEq(buffers.size, 0);
+test("wrong Bearer token is rejected", () => {
+	const result = checkBearerAuth("Bearer wrong-token", "my-secret-key-123");
+	assert(!result.authorized, "should be unauthorized with wrong token");
+	assertEq(result.response!.status, 401);
 });
 
-test("stream notification without taskId is ignored", () => {
-	const buffers = createStreamBuffers();
-	const result = processStreamNotification(
-		{ method: "task/stream", params: { chunk: "data", done: false } },
-		buffers,
-	);
-	assertEq(result.assembled, null);
-	assertEq(buffers.size, 0);
+test("Bearer token with different scheme is rejected", () => {
+	const result = checkBearerAuth("Basic my-secret-key-123", "my-secret-key-123");
+	assert(!result.authorized, "should be unauthorized with wrong scheme");
+	assertEq(result.response!.status, 401);
 });
 
-test("stream done deletes buffer and signals clear", () => {
-	const buffers = createStreamBuffers();
-	buffers.set("t1", "accumulated content");
-
-	const result = processStreamNotification(
-		{ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } },
-		buffers,
-	);
-	assertEq(result.assembled, null, "done should not return assembled content");
-	assertEq(result.bufferCleared, true);
-	assertEq(buffers.has("t1"), false, "buffer should be deleted");
+test("empty Bearer token is rejected", () => {
+	const result = checkBearerAuth("Bearer ", "my-secret-key-123");
+	assert(!result.authorized, "should be unauthorized with empty token");
+	assertEq(result.response!.status, 401);
 });
 
-test("stream done on unknown taskId is harmless", () => {
-	const buffers = createStreamBuffers();
-	const result = processStreamNotification(
-		{ method: "task/stream", params: { taskId: "nonexistent", chunk: "", done: true } },
-		buffers,
-	);
-	assertEq(result.bufferCleared, true);
-	assertEq(buffers.size, 0);
+test("token with extra whitespace is rejected (strict match)", () => {
+	const result = checkBearerAuth("Bearer  my-secret-key-123", "my-secret-key-123");
+	assert(!result.authorized, "should be unauthorized — strict match, no extra whitespace");
+});
+
+test("empty string secret still validates correctly", () => {
+	// Edge case: empty secret means Bearer with empty token
+	const result = checkBearerAuth("Bearer ", "");
+	assert(result.authorized, "empty secret should accept Bearer with empty token");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 5. Streaming: Chunk assembly from multiple notifications
+// 9. HTTP Adapter: /rpc endpoint task delivery and result
 // ═══════════════════════════════════════════════════════════════════════════
 
-console.log("\nStreaming: Chunk assembly from multiple notifications:");
+console.log("\nHTTP Adapter: /rpc endpoint:");
 
-test("multiple chunks assemble into full content", () => {
-	const buffers = createStreamBuffers();
-
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "Hello ", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "world", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "!", done: false } }, buffers);
-
-	assertEq(buffers.get("t1"), "Hello world!");
-});
-
-test("multiple tasks stream independently", () => {
-	const buffers = createStreamBuffers();
-
-	processStreamNotification({ method: "task/stream", params: { taskId: "task-a", chunk: "Alpha ", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "task-b", chunk: "Beta ", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "task-a", chunk: "content", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "task-b", chunk: "data", done: false } }, buffers);
-
-	assertEq(buffers.get("task-a"), "Alpha content");
-	assertEq(buffers.get("task-b"), "Beta data");
-});
-
-test("interleaved chunks from different tasks stay separate", () => {
-	const buffers = createStreamBuffers();
-
-	const chunks = [
-		{ taskId: "x", chunk: "a" },
-		{ taskId: "y", chunk: "1" },
-		{ taskId: "x", chunk: "b" },
-		{ taskId: "y", chunk: "2" },
-		{ taskId: "x", chunk: "c" },
-		{ taskId: "y", chunk: "3" },
-	];
-
-	for (const c of chunks) {
-		processStreamNotification({ method: "task/stream", params: { taskId: c.taskId, chunk: c.chunk, done: false } }, buffers);
+// Replicate handleHttpRpcForLink from index.ts (simplified for testing)
+function handleHttpRpcForLink(
+	link: LinkState,
+	msg: { jsonrpc: string; id: string; method?: string; params?: Record<string, unknown> },
+	loadTimeHash = "test-hash",
+	linkVersion = "v0.2.0",
+): Record<string, unknown> {
+	// Ping
+	if (msg.method === "ping") {
+		return {
+			jsonrpc: "2.0",
+			id: msg.id,
+			result: {
+				sessionId: link.meta.sessionId,
+				sessionName: link.meta.sessionName,
+				model: link.meta.model,
+				hash: loadTimeHash,
+			},
+		};
 	}
 
-	assertEq(buffers.get("x"), "abc");
-	assertEq(buffers.get("y"), "123");
+	// Version
+	if (msg.method === "version/get") {
+		return {
+			jsonrpc: "2.0",
+			id: msg.id,
+			result: { version: linkVersion, hash: loadTimeHash, sessionName: link.meta.sessionName },
+		};
+	}
+
+	// Task send
+	if (msg.method === "task/send") {
+		const p = msg.params as { taskId?: string; prompt?: string } | undefined;
+		if (!p?.prompt) {
+			return { jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Missing prompt parameter" } };
+		}
+		return {
+			jsonrpc: "2.0",
+			id: msg.id,
+			result: { taskId: p.taskId ?? "", status: "received", mode: "silent" },
+		};
+	}
+
+	return { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } };
+}
+
+test("/rpc ping returns session info", () => {
+	const link = makeLink({ linkId: "test-link", sessionName: "test-session", mode: "host", isConnected: true });
+	link.meta.sessionId = "sess-1";
+	link.meta.model = "gpt-4";
+
+	const response = handleHttpRpcForLink(link, { jsonrpc: "2.0", id: "req-1", method: "ping" });
+	assertEq(response.jsonrpc, "2.0");
+	assertEq(response.id, "req-1");
+	assertEq((response.result as any).sessionName, "test-session");
+	assertEq((response.result as any).sessionId, "sess-1");
+	assertEq((response.result as any).model, "gpt-4");
+	assertEq((response.result as any).hash, "test-hash");
 });
 
-test("empty chunk does not change buffer", () => {
-	const buffers = createStreamBuffers();
+test("/rpc version/get returns version and hash", () => {
+	const link = makeLink({ linkId: "v-link", sessionName: "ver-session", mode: "host", isConnected: true });
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "initial", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: false } }, buffers);
-
-	assertEq(buffers.get("t1"), "initial", "empty chunk should not alter buffer");
+	const response = handleHttpRpcForLink(link, { jsonrpc: "2.0", id: "req-v", method: "version/get" });
+	assertEq((response.result as any).version, "v0.2.0");
+	assertEq((response.result as any).hash, "test-hash");
+	assertEq((response.result as any).sessionName, "ver-session");
 });
 
-test("large chunk assembly preserves content", () => {
-	const buffers = createStreamBuffers();
-	const bigChunk = "x".repeat(10_000);
+test("/rpc task/send with prompt returns received status", () => {
+	const link = makeLink({ linkId: "task-link", sessionName: "task-session", mode: "host", isConnected: true });
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: bigChunk.slice(0, 5000), done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: bigChunk.slice(5000), done: false } }, buffers);
+	const response = handleHttpRpcForLink(link, {
+		jsonrpc: "2.0",
+		id: "req-task",
+		method: "task/send",
+		params: { taskId: "task-abc123", prompt: "Run the tests", mode: "silent", replyTo: "sender" },
+	});
 
-	assertEq(buffers.get("t1"), bigChunk);
-	assertEq(buffers.get("t1")!.length, 10_000);
+	assertEq((response.result as any).status, "received");
+	assertEq((response.result as any).taskId, "task-abc123");
+	assertEq((response.result as any).mode, "silent");
+	assertEq(response.error, undefined, "should not have error");
+});
+
+test("/rpc task/send without prompt returns error", () => {
+	const link = makeLink({ linkId: "err-link", sessionName: "err-session", mode: "host", isConnected: true });
+
+	const response = handleHttpRpcForLink(link, {
+		jsonrpc: "2.0",
+		id: "req-err",
+		method: "task/send",
+		params: { taskId: "task-xyz" },
+	});
+
+	assert((response.error as any).code === -32602, "should have invalid params error");
+	assertEq((response.error as any).message, "Missing prompt parameter");
+	assertEq(response.result, undefined, "should not have result");
+});
+
+test("/rpc task/send with empty prompt returns error", () => {
+	const link = makeLink({ linkId: "empty-link", sessionName: "empty-session", mode: "host", isConnected: true });
+
+	const response = handleHttpRpcForLink(link, {
+		jsonrpc: "2.0",
+		id: "req-empty",
+		method: "task/send",
+		params: { taskId: "task-empty", prompt: "" },
+	});
+
+	// Empty string is falsy in JS, so it should be rejected
+	assert((response.error as any).code === -32602, "should reject empty prompt");
+});
+
+test("/rpc unknown method returns method not found", () => {
+	const link = makeLink({ linkId: "unknown-link", sessionName: "unknown-session", mode: "host", isConnected: true });
+
+	const response = handleHttpRpcForLink(link, {
+		jsonrpc: "2.0",
+		id: "req-unk",
+		method: "nonexistent/method",
+	});
+
+	assert((response.error as any).code === -32601, "should have method not found error");
+	assertEq((response.error as any).message, "Method not found");
+});
+
+test("/rpc preserves request id in response", () => {
+	const link = makeLink({ linkId: "id-link", sessionName: "id-session", mode: "host", isConnected: true });
+
+	const customId = "my-custom-request-id-999";
+	const pingResp = handleHttpRpcForLink(link, { jsonrpc: "2.0", id: customId, method: "ping" });
+	assertEq(pingResp.id, customId, "ping should preserve request id");
+
+	const versionResp = handleHttpRpcForLink(link, { jsonrpc: "2.0", id: customId, method: "version/get" });
+	assertEq(versionResp.id, customId, "version should preserve request id");
+
+	const taskResp = handleHttpRpcForLink(link, { jsonrpc: "2.0", id: customId, method: "task/send", params: { prompt: "test" } });
+	assertEq(taskResp.id, customId, "task should preserve request id");
+
+	const errResp = handleHttpRpcForLink(link, { jsonrpc: "2.0", id: customId, method: "bogus" });
+	assertEq(errResp.id, customId, "error should preserve request id");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 6. Streaming: Stream completion clears buffer
+// 10. HTTP Adapter: /.well-known/agent.json discovery endpoint
 // ═══════════════════════════════════════════════════════════════════════════
 
-console.log("\nStreaming: Stream completion clears buffer:");
+console.log("\nHTTP Adapter: /.well-known/agent.json discovery:");
 
-test("done clears only the target task buffer", () => {
-	const buffers = createStreamBuffers();
+// Replicate the agent.json response from startHttpAdapter in index.ts
+function buildAgentCard(link: LinkState, port: number, linkVersion = "v0.2.0"): Record<string, unknown> {
+	return {
+		name: link.meta.sessionName,
+		url: `http://0.0.0.0:${port}`,
+		model: link.meta.model,
+		sessionId: link.meta.sessionId,
+		protocol: "pi-link",
+		version: linkVersion,
+		skills: ["task/send", "ping", "version/get"],
+	};
+}
 
-	buffers.set("t1", "content from t1");
-	buffers.set("t2", "content from t2");
+test("agent.json contains session name and url", () => {
+	const link = makeLink({ linkId: "disc-link", sessionName: "discover-me", mode: "host", isConnected: true });
+	link.meta.model = "claude-3";
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } }, buffers);
-
-	assertEq(buffers.has("t1"), false, "t1 should be cleared");
-	assertEq(buffers.get("t2"), "content from t2", "t2 should be unaffected");
-	assertEq(buffers.size, 1);
+	const card = buildAgentCard(link, 4567);
+	assertEq(card.name, "discover-me");
+	assertEq(card.url, "http://0.0.0.0:4567");
 });
 
-test("done then new chunks start fresh buffer", () => {
-	const buffers = createStreamBuffers();
+test("agent.json contains model and sessionId", () => {
+	const link = makeLink({ linkId: "disc-link", sessionName: "s", mode: "host", isConnected: true });
+	link.meta.sessionId = "sess-abc";
+	link.meta.model = "gpt-4o";
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "old", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } }, buffers);
-	assertEq(buffers.has("t1"), false);
-
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "new", done: false } }, buffers);
-	assertEq(buffers.get("t1"), "new", "should start fresh after done");
+	const card = buildAgentCard(link, 8080);
+	assertEq(card.model, "gpt-4o");
+	assertEq(card.sessionId, "sess-abc");
 });
 
-test("done on all tasks leaves buffers empty", () => {
-	const buffers = createStreamBuffers();
+test("agent.json contains protocol, version, and skills", () => {
+	const link = makeLink({ linkId: "disc-link", sessionName: "s", mode: "host", isConnected: true });
 
-	buffers.set("a", "data-a");
-	buffers.set("b", "data-b");
-	buffers.set("c", "data-c");
-
-	processStreamNotification({ method: "task/stream", params: { taskId: "a", chunk: "", done: true } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "b", chunk: "", done: true } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "c", chunk: "", done: true } }, buffers);
-
-	assertEq(buffers.size, 0, "all buffers should be cleared");
+	const card = buildAgentCard(link, 4567);
+	assertEq(card.protocol, "pi-link");
+	assertEq(card.version, "v0.2.0");
+	assert(Array.isArray(card.skills), "skills should be an array");
+	assert((card.skills as string[]).includes("task/send"), "skills should include task/send");
+	assert((card.skills as string[]).includes("ping"), "skills should include ping");
+	assert((card.skills as string[]).includes("version/get"), "skills should include version/get");
+	assertEq((card.skills as string[]).length, 3);
 });
 
-test("done with chunk is ignored (done takes priority)", () => {
-	const buffers = createStreamBuffers();
+test("agent.json url uses provided port", () => {
+	const link = makeLink({ linkId: "disc-link", sessionName: "s", mode: "host", isConnected: true });
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "before", done: false } }, buffers);
-	// done=true should delete buffer without appending the chunk
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "extra", done: true } }, buffers);
+	assertEq(buildAgentCard(link, 3000).url, "http://0.0.0.0:3000");
+	assertEq(buildAgentCard(link, 8080).url, "http://0.0.0.0:8080");
+	assertEq(buildAgentCard(link, 0).url, "http://0.0.0.0:0");
+});
 
-	assertEq(buffers.has("t1"), false, "buffer should be deleted on done");
+test("agent.json uses custom version", () => {
+	const link = makeLink({ linkId: "disc-link", sessionName: "s", mode: "host", isConnected: true });
+
+	const card = buildAgentCard(link, 4567, "v1.0.0");
+	assertEq(card.version, "v1.0.0");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 7. Streaming: Empty stream handling
+// 11. HTTP Adapter: /health endpoint
 // ═══════════════════════════════════════════════════════════════════════════
 
-console.log("\nStreaming: Empty stream handling:");
+console.log("\nHTTP Adapter: /health endpoint:");
 
-test("stream with only done signal never creates buffer entry", () => {
-	const buffers = createStreamBuffers();
+// Replicate the /health response from startHttpAdapter in index.ts
+function buildHealthResponse(link: LinkState): Record<string, unknown> {
+	return { status: "ok", session: link.meta.sessionName, transport: "http" };
+}
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } }, buffers);
+test("/health returns ok status", () => {
+	const link = makeLink({ linkId: "health-link", sessionName: "healthy-session", mode: "host", isConnected: true });
 
-	assertEq(buffers.size, 0, "no buffer entry should be created");
-	assertEq(buffers.has("t1"), false);
+	const health = buildHealthResponse(link);
+	assertEq(health.status, "ok");
 });
 
-test("stream with only empty chunks never creates buffer entry", () => {
-	const buffers = createStreamBuffers();
+test("/health includes session name", () => {
+	const link = makeLink({ linkId: "health-link", sessionName: "my-agent-session", mode: "host", isConnected: true });
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: false } }, buffers);
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: false } }, buffers);
-
-	assertEq(buffers.size, 0, "empty chunks should not create buffer entry");
+	const health = buildHealthResponse(link);
+	assertEq(health.session, "my-agent-session");
 });
 
-test("done on empty buffers is harmless", () => {
-	const buffers = createStreamBuffers();
+test("/health includes transport type", () => {
+	const link = makeLink({ linkId: "health-link", sessionName: "s", mode: "host", isConnected: true });
 
-	const result = processStreamNotification(
-		{ method: "task/stream", params: { taskId: "ghost", chunk: "", done: true } },
-		buffers,
-	);
-
-	assertEq(result.bufferCleared, true);
-	assertEq(buffers.size, 0);
-	// No error thrown — graceful handling
+	const health = buildHealthResponse(link);
+	assertEq(health.transport, "http");
 });
 
-test("done immediately after single chunk clears buffer", () => {
-	const buffers = createStreamBuffers();
+test("/health reflects current session name after update", () => {
+	const link = makeLink({ linkId: "health-link", sessionName: "original-name", mode: "host", isConnected: true });
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "only", done: false } }, buffers);
-	assertEq(buffers.get("t1"), "only");
+	link.meta.sessionName = "updated-name";
+	const health = buildHealthResponse(link);
+	assertEq(health.session, "updated-name", "health should reflect updated session name");
+});
 
-	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } }, buffers);
-	assertEq(buffers.has("t1"), false);
-	assertEq(buffers.size, 0);
+// ═══════════════════════════════════════════════════════════════════════════
+// 12. HTTP Adapter: UDS fallback for localhost connections
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log("\nHTTP Adapter: UDS fallback for localhost connections:");
+
+// Replicate the transport selection logic from index.ts:
+//   - If --http [port] is specified → transport = "http"
+//   - Otherwise → transport = "uds"
+//   - localhost URLs should prefer UDS when available
+function selectTransport(args: string, hasUdsSocket: boolean): "uds" | "http" {
+	const httpMatch = args.match(/--http(?:\s+(\d+))?/);
+	if (httpMatch) return "http";
+	return "uds";
+}
+
+function shouldFallbackToUds(url: string): boolean {
+	try {
+		const parsed = new URL(url);
+		const host = parsed.hostname.replace(/^\[|\]$/g, "");
+		return host === "localhost" || host === "127.0.0.1" || host === "::1";
+	} catch {
+		return false;
+	}
+}
+
+test("--http flag selects HTTP transport", () => {
+	assertEq(selectTransport("--http", true), "http");
+	assertEq(selectTransport("--http 8080", true), "http");
+	assertEq(selectTransport("my-link --http 3000", true), "http");
+});
+
+test("no --http flag selects UDS transport", () => {
+	assertEq(selectTransport("my-link", true), "uds");
+	assertEq(selectTransport("", true), "uds");
+	assertEq(selectTransport("my-link --no-http", true), "uds");
+});
+
+test("localhost URL triggers UDS fallback", () => {
+	assert(shouldFallbackToUds("http://localhost:4567"), "localhost should trigger UDS fallback");
+	assert(shouldFallbackToUds("http://127.0.0.1:4567"), "127.0.0.1 should trigger UDS fallback");
+	assert(shouldFallbackToUds("http://[::1]:4567"), "::1 should trigger UDS fallback");
+});
+
+test("non-localhost URL does not trigger UDS fallback", () => {
+	assert(!shouldFallbackToUds("http://server1.lan:4567"), "LAN hostname should not trigger fallback");
+	assert(!shouldFallbackToUds("http://192.168.50.71:4567"), "LAN IP should not trigger fallback");
+	assert(!shouldFallbackToUds("http://example.com:4567"), "public hostname should not trigger fallback");
+	assert(!shouldFallbackToUds("https://remote.host:4567"), "remote host should not trigger fallback");
+});
+
+test("invalid URL does not trigger UDS fallback", () => {
+	assert(!shouldFallbackToUds("not-a-url"), "invalid string should not trigger fallback");
+	assert(!shouldFallbackToUds(""), "empty string should not trigger fallback");
+	// localhost hostname triggers fallback regardless of scheme (function only checks hostname)
+	assert(shouldFallbackToUds("ftp://localhost:21"), "localhost hostname should still trigger fallback regardless of scheme");
+});
+
+test("--http flag overrides UDS preference even for localhost", () => {
+	// When --http is explicitly set, HTTP should be used regardless of hostname
+	assertEq(selectTransport("--http", true), "http");
+	assertEq(selectTransport("--http 4567", true), "http");
 });
 
 // ─── Teardown + Summary ──────────────────────────────────────────────────
 
 setTimeout(() => {
-	console.log(`\n${"─".repeat(40)}`);
+	console.log(`\n${"─".repeat(50)}`);
 	console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);
 	if (failed > 0) {
 		console.log("\n⚠️  Some tests failed!");
@@ -1053,4 +1586,4 @@ setTimeout(() => {
 		console.log("\n✅ All tests passed!");
 		process.exit(0);
 	}
-}, 500);
+}, 3000);
