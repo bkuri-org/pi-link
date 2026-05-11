@@ -141,6 +141,24 @@ export default function (pi: ExtensionAPI) {
 						sessionId: state.meta.sessionId,
 						sessionName: state.meta.sessionName,
 						model: state.meta.model,
+						hash: loadTimeHash,
+					},
+				});
+			}
+			return;
+		}
+
+		// Version query
+		if (msg.method === "version/get") {
+			const conn = state.connection;
+			if (conn && !conn.destroyed) {
+				sendJsonRpc(conn, {
+					jsonrpc: "2.0",
+					id: msg.id,
+					result: {
+						version: LINK_VERSION,
+						hash: loadTimeHash,
+						sessionName: state.meta.sessionName,
 					},
 				});
 			}
@@ -714,11 +732,43 @@ export default function (pi: ExtensionAPI) {
 	function cmdVersion(c: ExtensionContext): void {
 		try {
 			const content = fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "extensions", "link", "index.ts"), "utf-8");
-			const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 8);
-			if (hash !== loadTimeHash && loadTimeHash !== "unknown") {
-				c.ui.notify(`link extension ${LINK_VERSION} — loaded: ${loadTimeHash}, disk: ${hash} (STALE — /reload to update)`, "warning");
+			const diskHash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 8);
+			const localHash = loadTimeHash;
+			const lines: string[] = [];
+
+			// Local version info
+			if (diskHash !== localHash && localHash !== "unknown") {
+				lines.push(`⚠️ You: ${LINK_VERSION} loaded:${localHash} disk:${diskHash} (STALE — /reload to update)`);
 			} else {
-				c.ui.notify(`link extension ${LINK_VERSION} (${hash})`, "info");
+				lines.push(`You: ${LINK_VERSION} (${localHash})`);
+			}
+
+			// Query peer version if connected
+			if (state.isConnected && state.connection && !state.connection.destroyed) {
+				const reqId = crypto.randomUUID();
+				const timeout = setTimeout(() => {
+					state.resolveQueue.delete(reqId);
+					lines.push(`Peer: (no response — may be running older version without version/get support)`);
+					c.ui.notify(lines.join("\n"), localHash !== diskHash ? "warning" : "info");
+				}, 3000);
+
+				state.resolveQueue.set(reqId, (msg: any) => {
+					clearTimeout(timeout);
+					const peer = msg.result;
+					if (peer?.hash) {
+						const match = peer.hash === localHash;
+						const peerLabel = peer.sessionName ? ` (${peer.sessionName})` : "";
+						lines.push(`Peer${peerLabel}: ${peer.version || "?"} (${peer.hash})${match ? "" : " ⚠️ MISMATCH"}`);
+						c.ui.notify(lines.join("\n"), match ? "info" : "warning");
+					} else {
+						lines.push(`Peer: unknown version`);
+						c.ui.notify(lines.join("\n"), "info");
+					}
+				});
+
+				sendJsonRpc(state.connection, { jsonrpc: "2.0", id: reqId, method: "version/get", params: {} });
+			} else {
+				c.ui.notify(lines.join("\n"), localHash !== diskHash ? "warning" : "info");
 			}
 		} catch {
 			c.ui.notify(`link extension ${LINK_VERSION}`, "info");
