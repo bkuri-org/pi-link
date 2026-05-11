@@ -10,6 +10,7 @@ export const LINKS_DIR = path.join(os.homedir(), ".pi", "links");
 export const STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const SOCKET_TIMEOUT_MS = 120_000;
+export const HEARTBEAT_TIMEOUT_MS = 60_000;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -51,6 +52,7 @@ export interface LinkState {
 	isConnected: boolean;
 	peerInfo?: { sessionId: string; sessionName?: string; model?: string };
 	heartbeatTimer?: ReturnType<typeof setInterval>;
+	lastPeerActivity: number;
 	pendingTask?: PendingTask;
 }
 
@@ -71,6 +73,7 @@ export function createInitialState(): LinkState {
 		buffer: "",
 		resolveQueue: new Map(),
 		isConnected: false,
+		lastPeerActivity: 0,
 		pendingTask: undefined,
 	};
 }

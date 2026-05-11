@@ -365,9 +365,9 @@ export default function (pi: ExtensionAPI) {
 			socket.on("close", () => {
 				state.isConnected = false;
 				state.connection = undefined;
+				stopHeartbeat();
 				state.meta.status = "waiting";
 				writeMeta(linkDir, state.meta);
-				stopHeartbeat();
 				c.ui.notify("🔗 Peer disconnected", "warning");
 				updateWidget();
 			});
@@ -508,8 +508,11 @@ export default function (pi: ExtensionAPI) {
 			const taskId = generateId();
 			const taskMode = params.mode === "visible" ? "visible" : "silent";
 
+			const wantReply = (params.reply_to ?? "sender") === "sender";
+			const includeContext = params.include_context === true || (params.include_context === undefined && wantReply);
+
 			let context: string | undefined;
-			if (params.include_context) {
+			if (includeContext) {
 				const recent = c.sessionManager.getBranch()
 					.filter((e: any) => e.type === "message" && e.message.role === "assistant")
 					.slice(-5)
@@ -531,7 +534,7 @@ export default function (pi: ExtensionAPI) {
 				replyTo: params.reply_to ?? "sender",
 			}));
 
-			const willReply = (params.reply_to ?? "sender") === "sender";
+			const willReply = wantReply;
 			const badge = taskMode === "visible" ? "👁" : "🔇";
 			return {
 				content: [{ type: "text", text: `Task ${taskId.slice(0, 8)} sent to ${state.meta.sessionName} (${badge}).${willReply ? " Result will return." : " Fire-and-forget."}` }],
