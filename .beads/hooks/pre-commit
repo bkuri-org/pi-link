@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Village pre-commit hook
+# Fast checks that run before every commit.
+# Installed by: village up
+
+set -euo pipefail
+
+# Check if this is a Village-managed repo
+GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -d "$GIT_ROOT/.village" ] || exit 0
+
+echo "Village pre-commit checks..."
+echo ""
+
+echo "  ruff check..."
+if ! uv run ruff check .; then
+    echo ""
+    echo "  FAILED: ruff check found errors. Fix with 'uv run ruff check --fix .' or commit with --no-verify."
+    exit 1
+fi
+
+echo "  ruff format..."
+if ! uv run ruff format --check .; then
+    echo ""
+    echo "  FAILED: ruff format found issues. Fix with 'uv run ruff format .' or commit with --no-verify."
+    exit 1
+fi
+
+echo ""
+echo "Pre-commit checks passed."
+
+# --- BEGIN BEADS INTEGRATION v1.0.3 ---
+# This section is managed by beads. Do not remove these markers.
+if command -v bd >/dev/null 2>&1; then
+  export BD_GIT_HOOK=1
+  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_bd_timeout" bd hooks run pre-commit "$@"
+    _bd_exit=$?
+    if [ $_bd_exit -eq 124 ]; then
+      echo >&2 "beads: hook 'pre-commit' timed out after ${_bd_timeout}s — continuing without beads"
+      _bd_exit=0
+    fi
+  else
+    bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  fi
+  if [ $_bd_exit -eq 3 ]; then
+    echo >&2 "beads: database not initialized — skipping hook 'pre-commit'"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
+fi
+# --- END BEADS INTEGRATION v1.0.3 ---
