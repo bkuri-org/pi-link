@@ -35,7 +35,7 @@ import {
 
 let passed = 0;
 let failed = 0;
-const PREFIX = `__test_${crypto.randomBytes(4).toString("hex")}_`;
+const PREFIX = `disc_${crypto.randomBytes(4).toString("hex")}_`;
 const createdDirs: string[] = [];
 
 function testDir(id: string): string {
@@ -439,7 +439,7 @@ test("server detects client disconnect", () => {
 });
 
 test("writeMeta handles ENOENT gracefully (peer cleaned up dir)", () => {
-	const linkDir = path.join(LINKS_DIR, `${PREFIX}enoent-test-${Date.now()}`);
+	const linkDir = testDir("enoent-test");
 	// Don't create the dir — writeMeta should not throw
 	writeMeta(linkDir, {
 		id: "enoent",
