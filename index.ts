@@ -274,10 +274,10 @@ export default function (pi: ExtensionAPI) {
 		if (state.mode === "host" && state.linkId) {
 			cleanupLinkDir(path.join(LINKS_DIR, state.linkId));
 		}
-		// Clear recovery data on clean disconnect
-		if (state.meta.sessionId) {
-			deleteRecoveryData(state.meta.sessionId);
-		}
+		// Note: do NOT delete recovery data here — session_shutdown saves it before
+		// calling cleanup(). Recovery data is cleaned up by attemptRecovery() and ages
+		// out via STALE_THRESHOLD_MS. Intentional disconnects call deleteRecoveryData
+		// explicitly in cmdDisconnect().
 		state = createInitialState();
 		updateWidget();
 	}
@@ -688,6 +688,10 @@ export default function (pi: ExtensionAPI) {
 
 	function cmdDisconnect(c: ExtensionContext): void {
 		if (state.mode === "none") { c.ui.notify("Not linked", "info"); return; }
+		// Intentional disconnect — clear recovery data so reload doesn't re-establish
+		if (state.meta.sessionId) {
+			deleteRecoveryData(state.meta.sessionId);
+		}
 		c.ui.notify("🔗 Disconnected", "info");
 		cleanup();
 	}
