@@ -773,6 +773,274 @@ test("removeAll clears everything", () => {
 	assertEq(active.current.linkId, "");
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 4. Streaming: task/stream notification parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log("\nStreaming: task/stream notification parsing:");
+
+// Replicate the stream buffer logic from index.ts
+function createStreamBuffers(): Map<string, string> {
+	return new Map<string, string>();
+}
+
+/**
+ * Replicate the stream chunk processing from index.ts.
+ * Returns { assembled: string | null, bufferCleared: boolean }
+ */
+function processStreamNotification(
+	msg: { method?: string; params?: Record<string, unknown> },
+	streamBuffers: Map<string, string>,
+): { assembled: string | null; bufferCleared: boolean } {
+	if (msg.method !== "task/stream") return { assembled: null, bufferCleared: false };
+
+	const p = msg.params as { taskId?: string; chunk?: string; done?: boolean } | undefined;
+	if (!p || !p.taskId) return { assembled: null, bufferCleared: false };
+
+	if (p.done) {
+		streamBuffers.delete(p.taskId);
+		return { assembled: null, bufferCleared: true };
+	}
+
+	if (p.chunk) {
+		const existing = streamBuffers.get(p.taskId) ?? "";
+		streamBuffers.set(p.taskId, existing + p.chunk);
+	}
+
+	return { assembled: streamBuffers.get(p.taskId) ?? null, bufferCleared: false };
+}
+
+test("non-stream message is ignored", () => {
+	const buffers = createStreamBuffers();
+	const result = processStreamNotification({ method: "task/result", params: { taskId: "t1" } }, buffers);
+	assertEq(result.assembled, null);
+	assertEq(result.bufferCleared, false);
+	assertEq(buffers.size, 0);
+});
+
+test("stream notification with chunk appends to buffer", () => {
+	const buffers = createStreamBuffers();
+	const result = processStreamNotification(
+		{ method: "task/stream", params: { taskId: "t1", chunk: "Hello ", done: false } },
+		buffers,
+	);
+	assertEq(result.assembled, "Hello ");
+	assertEq(result.bufferCleared, false);
+	assertEq(buffers.get("t1"), "Hello ");
+});
+
+test("stream notification without params is ignored", () => {
+	const buffers = createStreamBuffers();
+	const result = processStreamNotification({ method: "task/stream" }, buffers);
+	assertEq(result.assembled, null);
+	assertEq(result.bufferCleared, false);
+	assertEq(buffers.size, 0);
+});
+
+test("stream notification without taskId is ignored", () => {
+	const buffers = createStreamBuffers();
+	const result = processStreamNotification(
+		{ method: "task/stream", params: { chunk: "data", done: false } },
+		buffers,
+	);
+	assertEq(result.assembled, null);
+	assertEq(buffers.size, 0);
+});
+
+test("stream done deletes buffer and signals clear", () => {
+	const buffers = createStreamBuffers();
+	buffers.set("t1", "accumulated content");
+
+	const result = processStreamNotification(
+		{ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } },
+		buffers,
+	);
+	assertEq(result.assembled, null, "done should not return assembled content");
+	assertEq(result.bufferCleared, true);
+	assertEq(buffers.has("t1"), false, "buffer should be deleted");
+});
+
+test("stream done on unknown taskId is harmless", () => {
+	const buffers = createStreamBuffers();
+	const result = processStreamNotification(
+		{ method: "task/stream", params: { taskId: "nonexistent", chunk: "", done: true } },
+		buffers,
+	);
+	assertEq(result.bufferCleared, true);
+	assertEq(buffers.size, 0);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. Streaming: Chunk assembly from multiple notifications
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log("\nStreaming: Chunk assembly from multiple notifications:");
+
+test("multiple chunks assemble into full content", () => {
+	const buffers = createStreamBuffers();
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "Hello ", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "world", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "!", done: false } }, buffers);
+
+	assertEq(buffers.get("t1"), "Hello world!");
+});
+
+test("multiple tasks stream independently", () => {
+	const buffers = createStreamBuffers();
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "task-a", chunk: "Alpha ", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "task-b", chunk: "Beta ", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "task-a", chunk: "content", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "task-b", chunk: "data", done: false } }, buffers);
+
+	assertEq(buffers.get("task-a"), "Alpha content");
+	assertEq(buffers.get("task-b"), "Beta data");
+});
+
+test("interleaved chunks from different tasks stay separate", () => {
+	const buffers = createStreamBuffers();
+
+	const chunks = [
+		{ taskId: "x", chunk: "a" },
+		{ taskId: "y", chunk: "1" },
+		{ taskId: "x", chunk: "b" },
+		{ taskId: "y", chunk: "2" },
+		{ taskId: "x", chunk: "c" },
+		{ taskId: "y", chunk: "3" },
+	];
+
+	for (const c of chunks) {
+		processStreamNotification({ method: "task/stream", params: { taskId: c.taskId, chunk: c.chunk, done: false } }, buffers);
+	}
+
+	assertEq(buffers.get("x"), "abc");
+	assertEq(buffers.get("y"), "123");
+});
+
+test("empty chunk does not change buffer", () => {
+	const buffers = createStreamBuffers();
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "initial", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: false } }, buffers);
+
+	assertEq(buffers.get("t1"), "initial", "empty chunk should not alter buffer");
+});
+
+test("large chunk assembly preserves content", () => {
+	const buffers = createStreamBuffers();
+	const bigChunk = "x".repeat(10_000);
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: bigChunk.slice(0, 5000), done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: bigChunk.slice(5000), done: false } }, buffers);
+
+	assertEq(buffers.get("t1"), bigChunk);
+	assertEq(buffers.get("t1")!.length, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. Streaming: Stream completion clears buffer
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log("\nStreaming: Stream completion clears buffer:");
+
+test("done clears only the target task buffer", () => {
+	const buffers = createStreamBuffers();
+
+	buffers.set("t1", "content from t1");
+	buffers.set("t2", "content from t2");
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } }, buffers);
+
+	assertEq(buffers.has("t1"), false, "t1 should be cleared");
+	assertEq(buffers.get("t2"), "content from t2", "t2 should be unaffected");
+	assertEq(buffers.size, 1);
+});
+
+test("done then new chunks start fresh buffer", () => {
+	const buffers = createStreamBuffers();
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "old", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } }, buffers);
+	assertEq(buffers.has("t1"), false);
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "new", done: false } }, buffers);
+	assertEq(buffers.get("t1"), "new", "should start fresh after done");
+});
+
+test("done on all tasks leaves buffers empty", () => {
+	const buffers = createStreamBuffers();
+
+	buffers.set("a", "data-a");
+	buffers.set("b", "data-b");
+	buffers.set("c", "data-c");
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "a", chunk: "", done: true } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "b", chunk: "", done: true } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "c", chunk: "", done: true } }, buffers);
+
+	assertEq(buffers.size, 0, "all buffers should be cleared");
+});
+
+test("done with chunk is ignored (done takes priority)", () => {
+	const buffers = createStreamBuffers();
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "before", done: false } }, buffers);
+	// done=true should delete buffer without appending the chunk
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "extra", done: true } }, buffers);
+
+	assertEq(buffers.has("t1"), false, "buffer should be deleted on done");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. Streaming: Empty stream handling
+// ═══════════════════════════════════════════════════════════════════════════
+
+console.log("\nStreaming: Empty stream handling:");
+
+test("stream with only done signal never creates buffer entry", () => {
+	const buffers = createStreamBuffers();
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } }, buffers);
+
+	assertEq(buffers.size, 0, "no buffer entry should be created");
+	assertEq(buffers.has("t1"), false);
+});
+
+test("stream with only empty chunks never creates buffer entry", () => {
+	const buffers = createStreamBuffers();
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: false } }, buffers);
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: false } }, buffers);
+
+	assertEq(buffers.size, 0, "empty chunks should not create buffer entry");
+});
+
+test("done on empty buffers is harmless", () => {
+	const buffers = createStreamBuffers();
+
+	const result = processStreamNotification(
+		{ method: "task/stream", params: { taskId: "ghost", chunk: "", done: true } },
+		buffers,
+	);
+
+	assertEq(result.bufferCleared, true);
+	assertEq(buffers.size, 0);
+	// No error thrown — graceful handling
+});
+
+test("done immediately after single chunk clears buffer", () => {
+	const buffers = createStreamBuffers();
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "only", done: false } }, buffers);
+	assertEq(buffers.get("t1"), "only");
+
+	processStreamNotification({ method: "task/stream", params: { taskId: "t1", chunk: "", done: true } }, buffers);
+	assertEq(buffers.has("t1"), false);
+	assertEq(buffers.size, 0);
+});
+
 // ─── Teardown + Summary ──────────────────────────────────────────────────
 
 setTimeout(() => {
