@@ -1,20 +1,26 @@
 /**
- * Link Extension — Connect two pi sessions via Unix domain sockets
+ * Link Extension — Connect pi sessions via Unix domain sockets or HTTP
  *
  * Two task modes:
  *   silent  (default) — spawns a headless pi subprocess, context stays clean
  *   visible — injects into session, both agents share context
  *
+ * Two transports:
+ *   uds  — Unix domain sockets (local, zero-dep)
+ *   http — HTTP adapter (cross-machine, shared secret auth)
+ *
+ * Multi-link: support multiple simultaneous connections.
+ *
  * Usage:
- *   /link create [name]     — create a link endpoint
- *   /link                    — pick an available link (auto-creates if none)
- *   /link status             — show connection info
- *   /link disconnect         — close the link
- *   /link version            — show version + content hash
- *   /link list               — show all available links
- *   /link http://host:port   — connect to remote link via HTTP
- *   /link-task <prompt>      — send a silent task
- *   /link-task --visible <prompt> — send a visible task
+ *   /link create [name] [--http [port]]  — create a link endpoint
+ *   /link                                 — pick an available link (auto-creates if none)
+ *   /link http://host:port                — connect to remote link via HTTP
+ *   /link status                          — show connection info
+ *   /link list                            — show all links
+ *   /link disconnect [id]                 — close a link
+ *   /link version                         — show version + content hash
+ *   /link-task <prompt>                   — send a silent task
+ *   /link-task --visible <prompt>         — send a visible task
  */
 
 import * as fs from "node:fs";
@@ -38,6 +44,7 @@ import {
 	type JsonRpcMessage,
 	type LinkState,
 	type LinkRecoveryData,
+	type PendingTask,
 	createInitialState,
 	ensureLinksDir,
 	generateId,
@@ -57,7 +64,7 @@ import {
 } from "./types.js";
 import { buildContextSnapshot, runSilentTask } from "./headless.js";
 
-const LINK_VERSION = "v0.1.0";
+const LINK_VERSION = "v0.2.0";
 
 // Compute content hash at load time for cache-bust detection
 const EXTENSION_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "link");
@@ -70,88 +77,151 @@ function computeHash(): string {
 const loadTimeHash = computeHash();
 
 export default function (pi: ExtensionAPI) {
-	let state = createInitialState();
+	// ─── Multi-link state ─────────────────────────────────────────────────
+	const linksRegistry = new Map<string, LinkState>();
+	let state = createInitialState(); // active link (backward compat)
 	let ctx: ExtensionContext | undefined;
+
+	function setActiveLink(id: string): void {
+		const link = linksRegistry.get(id);
+		if (link) state = link;
+	}
+
+	function getActiveLink(): LinkState | undefined {
+		if (state.mode !== "none") return state;
+		return undefined;
+	}
+
+	function addLink(link: LinkState): void {
+		linksRegistry.set(link.linkId, link);
+		state = link; // new link becomes active
+	}
+
+	function removeLink(linkId: string): void {
+		linksRegistry.delete(linkId);
+		// Set active to next available connected link, or first available
+		if (state.linkId === linkId) {
+			let next: LinkState | undefined;
+			for (const l of linksRegistry.values()) {
+				if (l.isConnected) { next = l; break; }
+			}
+			if (!next) next = linksRegistry.values().next().value;
+			state = next ?? createInitialState();
+		}
+	}
 
 	// ─── Widget ────────────────────────────────────────────────────────────
 
 	function updateWidget(): void {
 		if (!ctx) return;
 
-		if (state.mode === "none") {
+		if (linksRegistry.size === 0) {
 			ctx.ui.setWidget("link", undefined);
 			ctx.ui.setStatus("link", undefined);
 			return;
 		}
 
-		if (state.mode === "host") {
-			if (state.recovering) {
-				ctx.ui.setWidget("link", [`🔗 Recovering link...`, `  ${state.meta.sessionName}`]);
-				ctx.ui.setStatus("link", "🔗 recovering...");
+		if (linksRegistry.size === 1) {
+			// Single link — compact display
+			const link = linksRegistry.values().next().value;
+			renderSingleLinkWidget(link);
+			return;
+		}
+
+		// Multiple links
+		const lines: string[] = [`🔗 Links (${linksRegistry.size})`];
+		for (const [id, link] of linksRegistry) {
+			const prefix = id === state.linkId ? "→ " : "  ";
+			if (link.isConnected) {
+				const peer = link.peerInfo?.sessionName ?? link.meta.sessionName;
+				const transport = link.transport === "http" ? " [HTTP]" : "";
+				lines.push(`${prefix}🔗 ${peer}${transport}`);
+			} else if (link.mode === "host") {
+				lines.push(`${prefix}⏳ ${link.meta.sessionName} (waiting)`);
+			} else {
+				lines.push(`${prefix}❌ ${link.meta.sessionName} (disconnected)`);
+			}
+		}
+		ctx.ui.setWidget("link", lines);
+		const connectedCount = [...linksRegistry.values()].filter(l => l.isConnected).length;
+		ctx.ui.setStatus("link", `🔗 ${connectedCount}/${linksRegistry.size}`);
+	}
+
+	function renderSingleLinkWidget(link: LinkState): void {
+		if (link.mode === "none") {
+			ctx!.ui.setWidget("link", undefined);
+			ctx!.ui.setStatus("link", undefined);
+			return;
+		}
+
+		if (link.mode === "host") {
+			if (link.recovering) {
+				ctx!.ui.setWidget("link", [`🔗 Recovering link...`, `  ${link.meta.sessionName}`]);
+				ctx!.ui.setStatus("link", "🔗 recovering...");
 				return;
 			}
-			if (state.isConnected) {
-				const peer = state.peerInfo?.sessionName ?? "peer";
-				const transport = state.transport === "http" ? ` [HTTP :${state.httpPort}]` : "";
-				ctx.ui.setWidget("link", [`🔗 Linked (host) → ${peer}`, `  ${state.meta.model}${transport}`]);
-				ctx.ui.setStatus("link", `🔗 ${peer}`);
+			if (link.isConnected) {
+				const peer = link.peerInfo?.sessionName ?? "peer";
+				const transport = link.transport === "http" ? ` [HTTP :${link.httpPort}]` : "";
+				ctx!.ui.setWidget("link", [`🔗 Linked (host) → ${peer}`, `  ${link.meta.model}${transport}`]);
+				ctx!.ui.setStatus("link", `🔗 ${peer}`);
 			} else {
-				const transport = state.transport === "http" ? ` [HTTP :${state.httpPort}]` : "";
-				ctx.ui.setWidget("link", [`🔗 Waiting for peer...${transport}`, `  ${state.meta.sessionName}`, `  ${state.meta.model}`]);
-				ctx.ui.setStatus("link", "🔗 waiting...");
+				const transport = link.transport === "http" ? ` [HTTP :${link.httpPort}]` : "";
+				ctx!.ui.setWidget("link", [`🔗 Waiting for peer...${transport}`, `  ${link.meta.sessionName}`, `  ${link.meta.model}`]);
+				ctx!.ui.setStatus("link", "🔗 waiting...");
 			}
 			return;
 		}
 
 		// guest
-		if (state.recovering) {
-			ctx.ui.setWidget("link", [`🔗 Recovering link...`, `  ${state.meta.sessionName}`]);
-			ctx.ui.setStatus("link", "🔗 recovering...");
+		if (link.recovering) {
+			ctx!.ui.setWidget("link", [`🔗 Recovering link...`, `  ${link.meta.sessionName}`]);
+			ctx!.ui.setStatus("link", "🔗 recovering...");
 			return;
 		}
-		if (state.isConnected) {
-			const peer = state.meta.sessionName || state.meta.id;
-			const transport = state.transport === "http" ? ` [HTTP]` : "";
-			ctx.ui.setWidget("link", [`🔗 Linked (guest) → ${peer}${transport}`, `  ${state.peerInfo?.model ?? ""}`]);
-			ctx.ui.setStatus("link", `🔗 ${peer}`);
+		if (link.isConnected) {
+			const peer = link.meta.sessionName || link.meta.id;
+			const transport = link.transport === "http" ? " [HTTP]" : "";
+			ctx!.ui.setWidget("link", [`🔗 Linked (guest) → ${peer}${transport}`, `  ${link.peerInfo?.model ?? ""}`]);
+			ctx!.ui.setStatus("link", `🔗 ${peer}`);
 		} else {
-			ctx.ui.setWidget("link", undefined);
-			ctx.ui.setStatus("link", undefined);
+			ctx!.ui.setWidget("link", undefined);
+			ctx!.ui.setStatus("link", undefined);
 		}
 	}
 
-	// ─── Socket ────────────────────────────────────────────────────────────
+	// ─── Per-link message handling ─────────────────────────────────────────
+	// These functions operate on a specific link, not the global state.
 
-	function handleData(data: Buffer): void {
-		state.lastPeerActivity = Date.now();
-		state.buffer += data.toString();
-		const { messages, remaining } = parseJsonRpcLines(state.buffer);
-		state.buffer = remaining;
-		for (const msg of messages) handleMsg(msg);
+	function handleDataForLink(link: LinkState, data: Buffer): void {
+		link.lastPeerActivity = Date.now();
+		link.buffer += data.toString();
+		const { messages, remaining } = parseJsonRpcLines(link.buffer);
+		link.buffer = remaining;
+		for (const msg of messages) handleMsgForLink(link, msg);
 	}
 
-	function handleMsg(msg: JsonRpcMessage): void {
+	function handleMsgForLink(link: LinkState, msg: JsonRpcMessage): void {
 		// Resolve pending promises (ping responses)
 		if (!msg.method && msg.id) {
-			const resolver = state.resolveQueue.get(msg.id);
+			const resolver = link.resolveQueue.get(msg.id);
 			if (resolver) {
-				state.resolveQueue.delete(msg.id);
+				link.resolveQueue.delete(msg.id);
 				resolver(msg);
 			}
-			// Don't return — fall through to result handler
 		}
 
 		// Ping
 		if (msg.method === "ping") {
-			const conn = state.connection;
+			const conn = link.connection;
 			if (conn && !conn.destroyed) {
 				sendJsonRpc(conn, {
 					jsonrpc: "2.0",
 					id: msg.id,
 					result: {
-						sessionId: state.meta.sessionId,
-						sessionName: state.meta.sessionName,
-						model: state.meta.model,
+						sessionId: link.meta.sessionId,
+						sessionName: link.meta.sessionName,
+						model: link.meta.model,
 						hash: loadTimeHash,
 					},
 				});
@@ -161,7 +231,7 @@ export default function (pi: ExtensionAPI) {
 
 		// Version query
 		if (msg.method === "version/get") {
-			const conn = state.connection;
+			const conn = link.connection;
 			if (conn && !conn.destroyed) {
 				sendJsonRpc(conn, {
 					jsonrpc: "2.0",
@@ -169,7 +239,7 @@ export default function (pi: ExtensionAPI) {
 					result: {
 						version: LINK_VERSION,
 						hash: loadTimeHash,
-						sessionName: state.meta.sessionName,
+						sessionName: link.meta.sessionName,
 					},
 				});
 			}
@@ -184,15 +254,15 @@ export default function (pi: ExtensionAPI) {
 			const mode = p.mode === "visible" ? "visible" as const : "silent" as const;
 
 			// Ack
-			const conn = state.connection;
+			const conn = link.connection;
 			if (conn && !conn.destroyed) {
 				sendJsonRpc(conn, { jsonrpc: "2.0", id: msg.id, result: { taskId: p.taskId, status: "received", mode } });
 			}
 
 			if (mode === "silent") {
-				processSilentTask(p, conn);
+				processSilentTaskForLink(link, p);
 			} else {
-				processVisibleTask(p);
+				processVisibleTaskForLink(link, p);
 			}
 			return;
 		}
@@ -213,9 +283,9 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function processSilentTask(
+	async function processSilentTaskForLink(
+		link: LinkState,
 		p: { taskId: string; prompt: string; context?: string; replyTo?: string },
-		conn: net.Socket | undefined,
 	): Promise<void> {
 		const shouldReply = p.replyTo === "sender";
 		ctx?.ui.notify(`📥 Silent task: ${p.prompt.slice(0, 60)}...`, "info");
@@ -230,98 +300,120 @@ export default function (pi: ExtensionAPI) {
 			fullContext = ourContext;
 		}
 
-		const result = await runSilentTask(p.prompt, fullContext, ctx?.cwd ?? process.cwd(), state.meta.model);
+		const result = await runSilentTask(p.prompt, fullContext, ctx?.cwd ?? process.cwd(), link.meta.model);
 
-		if (shouldReply && conn && !conn.destroyed) {
-			sendJsonRpc(conn, {
-				jsonrpc: "2.0",
-				id: crypto.randomUUID(),
-				result: { taskId: p.taskId, status: "completed", content: result.output, error: result.error },
-			});
-			ctx?.ui.notify(`📤 Silent task result sent (${p.taskId.slice(0, 8)})`, "success");
+		if (shouldReply) {
+			const conn = link.connection;
+			if (conn && !conn.destroyed) {
+				sendJsonRpc(conn, {
+					jsonrpc: "2.0",
+					id: crypto.randomUUID(),
+					result: { taskId: p.taskId, status: "completed", content: result.output, error: result.error },
+				});
+				ctx?.ui.notify(`📤 Silent task result sent (${p.taskId.slice(0, 8)})`, "success");
+			}
 		}
 	}
 
-	function processVisibleTask(p: { taskId: string; prompt: string; context?: string; replyTo?: string }): void {
+	function processVisibleTaskForLink(link: LinkState, p: { taskId: string; prompt: string; context?: string; replyTo?: string }): void {
 		let prompt = p.prompt;
 		if (p.context) {
 			prompt = `## Context from linked session\n\n${p.context}\n\n---\n\n${p.prompt}`;
 		}
 
 		if (p.replyTo === "sender" && p.taskId) {
-			state.pendingTask = { taskId: p.taskId, replyTo: "sender", mode: "visible", receivedAt: Date.now() };
+			link.pendingTask = { taskId: p.taskId, replyTo: "sender", mode: "visible", receivedAt: Date.now() };
 		}
 
 		ctx?.ui.notify(`📥 Visible task: ${p.prompt.slice(0, 60)}...`, "info");
 		pi.sendUserMessage(prompt, { deliverAs: "steer" });
 	}
 
-	function handlePeerLost(reason: string): void {
-		stopHeartbeat();
-		if (state.connection) { state.connection.destroy(); state.connection = undefined; }
-		state.isConnected = false;
+	// ─── Per-link heartbeat & lifecycle ────────────────────────────────────
 
-		if (state.mode === "host") {
-			state.meta.status = "waiting";
-			writeMeta(path.join(LINKS_DIR, state.linkId), state.meta);
+	function startHeartbeatForLink(link: LinkState): void {
+		link.lastPeerActivity = Date.now();
+		link.heartbeatTimer = setInterval(() => {
+			const conn = link.connection;
+			if (!conn || conn.destroyed) return;
+
+			// Detect half-open connection
+			if (link.lastPeerActivity > 0 && Date.now() - link.lastPeerActivity > HEARTBEAT_TIMEOUT_MS) {
+				handlePeerLostForLink(link, "heartbeat timeout — no response from peer");
+				return;
+			}
+
+			sendJsonRpc(conn, createJsonRpc("ping", {
+				sessionId: link.meta.sessionId,
+				sessionName: link.meta.sessionName,
+			}));
+			link.meta.lastHeartbeat = Date.now();
+
+			if (link.mode === "host" && link.isConnected) {
+				writeMeta(path.join(LINKS_DIR, link.linkId), link.meta);
+			}
+		}, HEARTBEAT_INTERVAL_MS);
+	}
+
+	function stopHeartbeatForLink(link: LinkState): void {
+		if (link.heartbeatTimer) {
+			clearInterval(link.heartbeatTimer);
+			link.heartbeatTimer = undefined;
+		}
+	}
+
+	function handlePeerLostForLink(link: LinkState, reason: string): void {
+		stopHeartbeatForLink(link);
+		if (link.connection) { link.connection.destroy(); link.connection = undefined; }
+		link.isConnected = false;
+
+		if (link.mode === "host") {
+			link.meta.status = "waiting";
+			writeMeta(path.join(LINKS_DIR, link.linkId), link.meta);
 		} else {
-			state.mode = "none";
-			state.linkId = "";
-			state.socketPath = "";
-			state.meta.status = "waiting";
+			link.mode = link.mode; // keep mode for display
+			link.linkId = link.linkId;
+			link.socketPath = "";
+			link.meta.status = "waiting";
 		}
 
 		ctx?.ui.notify(`🔗 Peer lost: ${reason}`, "warning");
 		updateWidget();
 	}
 
-	function startHeartbeat(): void {
-		state.lastPeerActivity = Date.now();
-		state.heartbeatTimer = setInterval(() => {
-			const conn = state.connection;
-			if (!conn || conn.destroyed) return;
-
-			// Detect half-open connection
-			if (state.lastPeerActivity > 0 && Date.now() - state.lastPeerActivity > HEARTBEAT_TIMEOUT_MS) {
-				handlePeerLost("heartbeat timeout — no response from peer");
-				return;
-			}
-
-			sendJsonRpc(conn, createJsonRpc("ping", {
-				sessionId: state.meta.sessionId,
-				sessionName: state.meta.sessionName,
-			}));
-			state.meta.lastHeartbeat = Date.now();
-
-			if (state.mode === "host" && state.isConnected) {
-				writeMeta(path.join(LINKS_DIR, state.linkId), state.meta);
-			}
-		}, HEARTBEAT_INTERVAL_MS);
+	function cleanupLink(link: LinkState): void {
+		stopHeartbeatForLink(link);
+		if (link.connection) { link.connection.destroy(); link.connection = undefined; }
+		if (link.server) { link.server.close(); link.server = undefined; }
+		if (link.httpServer) {
+			link.httpServer.close();
+			link.httpServer = undefined;
+			link.httpPort = undefined;
+		}
+		if (link.mode === "host" && link.linkId) {
+			cleanupLinkDir(path.join(LINKS_DIR, link.linkId));
+		}
+		if (link.meta.sessionId) {
+			deleteRecoveryData(link.meta.sessionId);
+		}
+		removeLink(link.linkId);
+		updateWidget();
 	}
 
-	function stopHeartbeat(): void {
-		if (state.heartbeatTimer) {
-			clearInterval(state.heartbeatTimer);
-			state.heartbeatTimer = undefined;
+	function cleanupAll(): void {
+		for (const link of linksRegistry.values()) {
+			stopHeartbeatForLink(link);
+			if (link.connection) { link.connection.destroy(); link.connection = undefined; }
+			if (link.server) { link.server.close(); link.server = undefined; }
+			if (link.httpServer) { link.httpServer.close(); link.httpServer = undefined; }
+			if (link.mode === "host" && link.linkId) {
+				cleanupLinkDir(path.join(LINKS_DIR, link.linkId));
+			}
+			if (link.meta.sessionId) {
+				deleteRecoveryData(link.meta.sessionId);
+			}
 		}
-	}
-
-	function cleanup(): void {
-		stopHeartbeat();
-		if (state.connection) { state.connection.destroy(); state.connection = undefined; }
-		if (state.server) { state.server.close(); state.server = undefined; }
-		if (state.httpServer) {
-			state.httpServer.close();
-			state.httpServer = undefined;
-			state.httpPort = undefined;
-		}
-		if (state.mode === "host" && state.linkId) {
-			cleanupLinkDir(path.join(LINKS_DIR, state.linkId));
-		}
-		// Clear recovery data on clean disconnect
-		if (state.meta.sessionId) {
-			deleteRecoveryData(state.meta.sessionId);
-		}
+		linksRegistry.clear();
 		state = createInitialState();
 		updateWidget();
 	}
@@ -337,7 +429,7 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	function startHttpAdapter(port: number, secret: string): http.Server {
+	function startHttpAdapter(link: LinkState, port: number, secret: string): http.Server {
 		const server = http.createServer(async (req, res) => {
 			// CORS
 			res.setHeader("Access-Control-Allow-Origin", "*");
@@ -362,10 +454,10 @@ export default function (pi: ExtensionAPI) {
 			if (req.url === "/.well-known/agent.json" && req.method === "GET") {
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({
-					name: state.meta.sessionName,
+					name: link.meta.sessionName,
 					url: `http://0.0.0.0:${port}`,
-					model: state.meta.model,
-					sessionId: state.meta.sessionId,
+					model: link.meta.model,
+					sessionId: link.meta.sessionId,
 					protocol: "pi-link",
 					version: LINK_VERSION,
 					skills: ["task/send", "ping", "version/get"],
@@ -376,7 +468,7 @@ export default function (pi: ExtensionAPI) {
 			// Health check
 			if (req.url === "/health" && req.method === "GET") {
 				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ status: "ok", session: state.meta.sessionName, transport: "http" }));
+				res.end(JSON.stringify({ status: "ok", session: link.meta.sessionName, transport: "http" }));
 				return;
 			}
 
@@ -385,7 +477,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const body = await readBody(req);
 					const msg = JSON.parse(body) as JsonRpcMessage;
-					const response = await handleHttpRpc(msg);
+					const response = await handleHttpRpcForLink(link, msg);
 					res.writeHead(200, { "Content-Type": "application/json" });
 					res.end(JSON.stringify(response));
 				} catch (err: any) {
@@ -410,16 +502,16 @@ export default function (pi: ExtensionAPI) {
 		return server;
 	}
 
-	async function handleHttpRpc(msg: JsonRpcMessage): Promise<JsonRpcMessage> {
+	async function handleHttpRpcForLink(link: LinkState, msg: JsonRpcMessage): Promise<JsonRpcMessage> {
 		// Ping
 		if (msg.method === "ping") {
 			return {
 				jsonrpc: "2.0",
 				id: msg.id,
 				result: {
-					sessionId: state.meta.sessionId,
-					sessionName: state.meta.sessionName,
-					model: state.meta.model,
+					sessionId: link.meta.sessionId,
+					sessionName: link.meta.sessionName,
+					model: link.meta.model,
 					hash: loadTimeHash,
 				},
 			};
@@ -430,7 +522,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				jsonrpc: "2.0",
 				id: msg.id,
-				result: { version: LINK_VERSION, hash: loadTimeHash, sessionName: state.meta.sessionName },
+				result: { version: LINK_VERSION, hash: loadTimeHash, sessionName: link.meta.sessionName },
 			};
 		}
 
@@ -455,7 +547,7 @@ export default function (pi: ExtensionAPI) {
 					fullContext = ourContext;
 				}
 
-				const result = await runSilentTask(p.prompt, fullContext, ctx?.cwd ?? process.cwd(), state.meta.model);
+				const result = await runSilentTask(p.prompt, fullContext, ctx?.cwd ?? process.cwd(), link.meta.model);
 				ctx?.ui.notify(`📤 HTTP task result sent (${p.taskId.slice(0, 8)})`, "success");
 				return {
 					jsonrpc: "2.0",
@@ -464,7 +556,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			} else {
 				// Visible mode — inject into session, return ack
-				processVisibleTask(p);
+				processVisibleTaskForLink(link, p);
 				return {
 					jsonrpc: "2.0",
 					id: msg.id,
@@ -476,7 +568,7 @@ export default function (pi: ExtensionAPI) {
 		return { jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "Method not found" } };
 	}
 
-	async function connectHttpRemote(url: string, secret: string): Promise<void> {
+	async function connectHttpRemote(url: string, secret: string): Promise<LinkState> {
 		// Discover remote session info
 		const agentUrl = url.replace(/\/$/, "") + "/.well-known/agent.json";
 		const agentInfo = await new Promise<any>((resolve, reject) => {
@@ -502,20 +594,22 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		// Ping to verify connectivity
+		const link = createInitialState();
 		const pingResponse = await httpPostRpc(url, secret, createJsonRpc("ping", {
 			sessionId: state.meta.sessionId,
 			sessionName: state.meta.sessionName,
 		}));
 
-		state.mode = "guest";
-		state.transport = "http";
-		state.linkId = agentInfo.sessionId ?? generateId();
-		state.httpRemoteUrl = url;
-		state.httpSecret = secret;
-		state.isConnected = true;
-		state.lastPeerActivity = Date.now();
-		state.meta = {
-			id: state.linkId,
+		const linkId = agentInfo.sessionId ?? generateId();
+		link.mode = "guest";
+		link.transport = "http";
+		link.linkId = linkId;
+		link.httpRemoteUrl = url;
+		link.httpSecret = secret;
+		link.isConnected = true;
+		link.lastPeerActivity = Date.now();
+		link.meta = {
+			id: linkId,
 			sessionId: agentInfo.sessionId ?? "",
 			sessionName: agentInfo.name ?? "remote",
 			model: agentInfo.model ?? "unknown",
@@ -523,28 +617,31 @@ export default function (pi: ExtensionAPI) {
 			lastHeartbeat: Date.now(),
 			status: "connected",
 		};
-		state.peerInfo = {
+		link.peerInfo = {
 			sessionId: pingResponse.result?.sessionId as string ?? "",
 			sessionName: pingResponse.result?.sessionName as string ?? agentInfo.name,
 			model: pingResponse.result?.model as string ?? agentInfo.model,
 		};
 
-		// Start HTTP heartbeat (periodic ping to detect liveness)
-		state.heartbeatTimer = setInterval(async () => {
-			if (Date.now() - state.lastPeerActivity > HEARTBEAT_TIMEOUT_MS) {
-				handlePeerLost("HTTP heartbeat timeout");
+		// Start HTTP heartbeat
+		link.heartbeatTimer = setInterval(async () => {
+			if (Date.now() - link.lastPeerActivity > HEARTBEAT_TIMEOUT_MS) {
+				handlePeerLostForLink(link, "HTTP heartbeat timeout");
 				return;
 			}
 			try {
-				await httpPostRpc(state.httpRemoteUrl!, state.httpSecret!, createJsonRpc("ping", {
-					sessionId: state.meta.sessionId,
-					sessionName: state.meta.sessionName,
+				await httpPostRpc(link.httpRemoteUrl!, link.httpSecret!, createJsonRpc("ping", {
+					sessionId: link.meta.sessionId,
+					sessionName: link.meta.sessionName,
 				}), 10_000);
-				state.lastPeerActivity = Date.now();
+				link.lastPeerActivity = Date.now();
 			} catch {
-				// Remote unreachable — but don't immediately disconnect, let timeout handle it
+				// Remote unreachable — let timeout handle it
 			}
 		}, HEARTBEAT_INTERVAL_MS);
+
+		addLink(link);
+		return link;
 	}
 
 	// ─── Recovery ─────────────────────────────────────────────────────────
@@ -553,13 +650,11 @@ export default function (pi: ExtensionAPI) {
 		const recovery = loadRecoveryData(state.meta.sessionId);
 		if (!recovery) return;
 
-		// Don't try to recover if too old (stale)
 		if (Date.now() - recovery.savedAt > STALE_THRESHOLD_MS) {
 			deleteRecoveryData(state.meta.sessionId);
 			return;
 		}
 
-		// Only recover if we have a linkId
 		if (!recovery.linkId) {
 			deleteRecoveryData(state.meta.sessionId);
 			return;
@@ -574,7 +669,6 @@ export default function (pi: ExtensionAPI) {
 			await recoverAsGuest(recovery, c);
 		}
 
-		// Clear recovery data regardless of success
 		deleteRecoveryData(state.meta.sessionId);
 		state.recovering = false;
 		updateWidget();
@@ -585,10 +679,7 @@ export default function (pi: ExtensionAPI) {
 		const linkDir = path.join(LINKS_DIR, recovery.linkId);
 		const sockPath = path.join(linkDir, "link.sock");
 
-		// Check if the link dir still exists (peer may have cleaned it up)
-		const existingMeta = readMeta(linkDir);
-
-		// Recreate the link directory and meta
+		const link = createInitialState();
 		fs.mkdirSync(linkDir, { recursive: true });
 		const meta: LinkMeta = {
 			...recovery.meta,
@@ -597,32 +688,32 @@ export default function (pi: ExtensionAPI) {
 			lastHeartbeat: Date.now(),
 			status: "waiting",
 		};
+		link.meta = meta;
 		writeMeta(linkDir, meta);
 
-		// Create server
 		const server = net.createServer((socket) => {
-			state.connection = socket;
-			state.isConnected = true;
-			state.buffer = "";
-			state.lastPeerActivity = Date.now();
-			state.recovering = false;
-			state.meta.status = "connected";
-			writeMeta(linkDir, state.meta);
+			link.connection = socket;
+			link.isConnected = true;
+			link.buffer = "";
+			link.lastPeerActivity = Date.now();
+			link.recovering = false;
+			link.meta.status = "connected";
+			writeMeta(linkDir, link.meta);
 
-			socket.on("data", handleData);
+			socket.on("data", (data) => handleDataForLink(link, data));
 			socket.on("close", () => {
-				stopHeartbeat();
-				state.isConnected = false;
-				state.connection = undefined;
-				state.meta.status = "waiting";
-				writeMeta(linkDir, state.meta);
+				stopHeartbeatForLink(link);
+				link.isConnected = false;
+				link.connection = undefined;
+				link.meta.status = "waiting";
+				writeMeta(linkDir, link.meta);
 				c.ui.notify("🔗 Peer disconnected", "warning");
 				updateWidget();
 			});
 			socket.on("error", (err) => { console.error("Link socket error:", err.message); });
 
 			sendJsonRpc(socket, createJsonRpc("ping", { sessionId: meta.sessionId, sessionName: meta.sessionName }));
-			startHeartbeat();
+			startHeartbeatForLink(link);
 			c.ui.notify("🔗 Peer reconnected!", "success");
 			updateWidget();
 		});
@@ -635,13 +726,14 @@ export default function (pi: ExtensionAPI) {
 				server.on("error", reject);
 			});
 
-			state.mode = "host";
-			state.linkId = recovery.linkId;
-			state.socketPath = sockPath;
-			state.meta = meta;
-			state.server = server;
-			if (recovery.peerInfo) state.peerInfo = recovery.peerInfo;
+			link.mode = "host";
+			link.transport = "uds";
+			link.linkId = recovery.linkId;
+			link.socketPath = sockPath;
+			link.server = server;
+			if (recovery.peerInfo) link.peerInfo = recovery.peerInfo;
 
+			addLink(link);
 			c.ui.notify(`🔗 Link recovered (host): ${recovery.linkId}`, "success");
 		} catch (err: any) {
 			c.ui.notify(`🔗 Link recovery failed: ${err.message}`, "warning");
@@ -652,31 +744,32 @@ export default function (pi: ExtensionAPI) {
 		const linkDir = path.join(LINKS_DIR, recovery.linkId);
 		const sockPath = path.join(linkDir, "link.sock");
 
-		// Check if the host's link dir still exists
 		const hostMeta = readMeta(linkDir);
 		if (!hostMeta) {
 			c.ui.notify("🔗 Link recovery failed: host link no longer exists", "warning");
 			return;
 		}
 
+		const link = createInitialState();
 		const socket = new net.Socket();
 		socket.setTimeout(SOCKET_TIMEOUT_MS);
 
-		socket.on("data", handleData);
+		socket.on("data", (data) => handleDataForLink(link, data));
 		socket.on("close", () => {
-			state.isConnected = false;
-			state.connection = undefined;
-			stopHeartbeat();
+			link.isConnected = false;
+			link.connection = undefined;
+			stopHeartbeatForLink(link);
 			c.ui.notify("🔗 Link closed", "warning");
-			cleanup();
+			cleanupLink(link);
 		});
 		socket.on("error", (err) => {
 			console.error("Link error:", err.message);
 			c.ui.notify(`🔗 Reconnection failed: ${err.message}`, "warning");
-			state.mode = "none";
+			link.mode = "none";
+			removeLink(link.linkId);
 			updateWidget();
 		});
-		socket.on("timeout", () => { c.ui.notify("🔗 Link timed out", "warning"); socket.destroy(); cleanup(); });
+		socket.on("timeout", () => { c.ui.notify("🔗 Link timed out", "warning"); socket.destroy(); cleanupLink(link); });
 
 		try {
 			await new Promise<void>((resolve, reject) => {
@@ -684,19 +777,21 @@ export default function (pi: ExtensionAPI) {
 				socket.on("error", reject);
 			});
 
-			state.mode = "guest";
-			state.linkId = recovery.linkId;
-			state.socketPath = sockPath;
-			state.meta = hostMeta;
-			state.connection = socket;
-			state.isConnected = true;
-			state.recovering = false;
-			state.buffer = "";
-			state.lastPeerActivity = Date.now();
-			if (recovery.peerInfo) state.peerInfo = recovery.peerInfo;
+			link.mode = "guest";
+			link.transport = "uds";
+			link.linkId = recovery.linkId;
+			link.socketPath = sockPath;
+			link.meta = hostMeta;
+			link.connection = socket;
+			link.isConnected = true;
+			link.recovering = false;
+			link.buffer = "";
+			link.lastPeerActivity = Date.now();
+			if (recovery.peerInfo) link.peerInfo = recovery.peerInfo;
 
-			sendJsonRpc(socket, createJsonRpc("ping", { sessionId: state.meta.sessionId, sessionName: state.meta.sessionName }));
-			startHeartbeat();
+			addLink(link);
+			sendJsonRpc(socket, createJsonRpc("ping", { sessionId: link.meta.sessionId, sessionName: link.meta.sessionName }));
+			startHeartbeatForLink(link);
 			c.ui.notify(`🔗 Link recovered (guest) → ${hostMeta.sessionName}`, "success");
 			updateWidget();
 		} catch (err: any) {
@@ -739,40 +834,47 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (event) => {
 		// Persist link state for recovery on reload
-		if (state.mode !== "none" && state.meta.sessionId && (event as any).reason === "reload") {
-			saveRecoveryData(state.meta.sessionId, {
-				sessionId: state.meta.sessionId,
-				mode: state.mode as "host" | "guest",
-				linkId: state.linkId,
-				meta: state.meta,
-				peerInfo: state.peerInfo,
-				savedAt: Date.now(),
-			});
+		if (linksRegistry.size > 0 && (event as any).reason === "reload") {
+			for (const link of linksRegistry.values()) {
+				if (link.mode !== "none" && link.meta.sessionId) {
+					saveRecoveryData(link.meta.sessionId, {
+						sessionId: link.meta.sessionId,
+						mode: link.mode as "host" | "guest",
+						linkId: link.linkId,
+						meta: link.meta,
+						peerInfo: link.peerInfo,
+						savedAt: Date.now(),
+					});
+				}
+			}
 		}
-		cleanup();
+		cleanupAll();
 	});
 
 	pi.on("agent_end", async (event, c) => {
-		if (!state.pendingTask || !state.isConnected) return;
-		if (state.pendingTask.mode !== "visible") return;
+		// Check all links for pending visible tasks
+		for (const link of linksRegistry.values()) {
+			if (!link.pendingTask || !link.isConnected) continue;
+			if (link.pendingTask.mode !== "visible") continue;
 
-		const task = state.pendingTask;
-		state.pendingTask = undefined;
+			const task = link.pendingTask;
+			link.pendingTask = undefined;
 
-		const conn = state.connection;
-		if (!conn || conn.destroyed) return;
+			const conn = link.connection;
+			if (!conn || conn.destroyed) continue;
 
-		let resultText = "";
-		for (let i = event.messages.length - 1; i >= 0; i--) {
-			if (event.messages[i].role === "assistant") {
-				resultText = (event.messages[i].content as Array<{ type: string; text?: string }>)
-					.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");
-				break;
+			let resultText = "";
+			for (let i = event.messages.length - 1; i >= 0; i--) {
+				if (event.messages[i].role === "assistant") {
+					resultText = (event.messages[i].content as Array<{ type: string; text?: string }>)
+						.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");
+					break;
+				}
 			}
-		}
 
-		sendJsonRpc(conn, { jsonrpc: "2.0", id: crypto.randomUUID(), result: { taskId: task.taskId, status: "completed", content: resultText } });
-		c.ui.notify("📤 Task result sent to peer", "success");
+			sendJsonRpc(conn, { jsonrpc: "2.0", id: crypto.randomUUID(), result: { taskId: task.taskId, status: "completed", content: resultText } });
+			c.ui.notify("📤 Task result sent to peer", "success");
+		}
 	});
 
 	// ─── Commands ──────────────────────────────────────────────────────────
@@ -794,7 +896,7 @@ export default function (pi: ExtensionAPI) {
 			switch (sub) {
 				case "create": return cmdCreate(rest, c);
 				case "status": return cmdStatus(c);
-				case "disconnect": return cmdDisconnect(c);
+				case "disconnect": return cmdDisconnect(rest, c);
 				case "version": return cmdVersion(c);
 				case "list": return cmdList(c);
 				case "": return cmdJoin(c);
@@ -810,7 +912,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("link-task", {
 		description: "Send a task to the linked session (--visible to inject into peer session)",
 		handler: async (args, c) => {
-			if (!state.isConnected) { c.ui.notify("Not linked. Use /link to connect.", "warning"); return; }
+			const link = getActiveLink();
+			if (!link?.isConnected) { c.ui.notify("Not linked. Use /link to connect.", "warning"); return; }
 
 			const trimmed = args.trim();
 			if (!trimmed) { c.ui.notify("Usage: /link-task [--visible] <prompt>", "error"); return; }
@@ -819,8 +922,13 @@ export default function (pi: ExtensionAPI) {
 			const prompt = isVisible ? trimmed.replace(/^--visible\s*/, "").trim() : trimmed;
 			if (!prompt) { c.ui.notify("Usage: /link-task [--visible] <prompt>", "error"); return; }
 
-			const conn = state.connection;
-			if (!conn || conn.destroyed) { c.ui.notify("Connection lost", "error"); cleanup(); return; }
+			if (link.transport === "http" && link.httpRemoteUrl && link.httpSecret) {
+				c.ui.notify("HTTP task sent via /link-task not yet supported. Use the link_send_task tool.", "warning");
+				return;
+			}
+
+			const conn = link.connection;
+			if (!conn || conn.destroyed) { c.ui.notify("Connection lost", "error"); cleanupLink(link); return; }
 
 			sendJsonRpc(conn, createJsonRpc("task/send", {
 				taskId: generateId(),
@@ -830,13 +938,11 @@ export default function (pi: ExtensionAPI) {
 			}));
 
 			const badge = isVisible ? "👁 visible" : "🔇 silent";
-			c.ui.notify(`📤 Task sent (${badge})`, "info");
+			c.ui.notify(`📤 Task sent (${badge}) to ${link.meta.sessionName}`, "info");
 		},
 	});
 
 	async function cmdCreate(args: string, c: ExtensionContext): Promise<void> {
-		if (state.mode !== "none") { c.ui.notify("Already linked. /link disconnect first.", "warning"); return; }
-
 		// Parse --http [port] flag
 		const httpMatch = args.match(/--http(?:\s+(\d+))?/);
 		const httpPort = httpMatch ? parseInt(httpMatch[1] || String(HTTP_LINK_DEFAULT_PORT), 10) : undefined;
@@ -848,6 +954,7 @@ export default function (pi: ExtensionAPI) {
 		const sockPath = path.join(linkDir, "link.sock");
 		fs.mkdirSync(linkDir, { recursive: true });
 
+		const link = createInitialState();
 		const meta: LinkMeta = {
 			id: linkId,
 			sessionId: state.meta.sessionId,
@@ -857,30 +964,31 @@ export default function (pi: ExtensionAPI) {
 			lastHeartbeat: Date.now(),
 			status: "waiting",
 		};
+		link.meta = meta;
 		writeMeta(linkDir, meta);
 
 		const server = net.createServer((socket) => {
-			state.connection = socket;
-			state.isConnected = true;
-			state.buffer = "";
-			state.lastPeerActivity = Date.now();
-			state.meta.status = "connected";
-			writeMeta(linkDir, state.meta);
+			link.connection = socket;
+			link.isConnected = true;
+			link.buffer = "";
+			link.lastPeerActivity = Date.now();
+			link.meta.status = "connected";
+			writeMeta(linkDir, link.meta);
 
-			socket.on("data", handleData);
+			socket.on("data", (data) => handleDataForLink(link, data));
 			socket.on("close", () => {
-				stopHeartbeat();
-				state.isConnected = false;
-				state.connection = undefined;
-				state.meta.status = "waiting";
-				writeMeta(linkDir, state.meta);
+				stopHeartbeatForLink(link);
+				link.isConnected = false;
+				link.connection = undefined;
+				link.meta.status = "waiting";
+				writeMeta(linkDir, link.meta);
 				c.ui.notify("🔗 Peer disconnected", "warning");
 				updateWidget();
 			});
 			socket.on("error", (err) => { console.error("Link socket error:", err.message); });
 
 			sendJsonRpc(socket, createJsonRpc("ping", { sessionId: meta.sessionId, sessionName: meta.sessionName }));
-			startHeartbeat();
+			startHeartbeatForLink(link);
 			c.ui.notify("🔗 Peer connected!", "success");
 			updateWidget();
 		});
@@ -892,29 +1000,27 @@ export default function (pi: ExtensionAPI) {
 			server.on("error", reject);
 		});
 
-		state.mode = "host";
-		state.transport = httpPort ? "http" : "uds";
-		state.linkId = linkId;
-		state.socketPath = sockPath;
-		state.meta = meta;
-		state.server = server;
+		link.mode = "host";
+		link.transport = httpPort ? "http" : "uds";
+		link.linkId = linkId;
+		link.socketPath = sockPath;
+		link.server = server;
 
 		// Start HTTP adapter if requested
 		if (httpPort) {
 			const secret = ensureLinkSecret();
-			state.httpServer = startHttpAdapter(httpPort, secret);
-			state.httpPort = httpPort;
-			state.httpSecret = secret;
-			c.ui.notify(`🔗 Shared secret: ${secret.slice(0, 8)}... (full: ${HTTP_LINK_SECRET_FILE})`, "info");
+			link.httpServer = startHttpAdapter(link, httpPort, secret);
+			link.httpPort = httpPort;
+			link.httpSecret = secret;
+			c.ui.notify(`🔗 Shared secret: ${secret.slice(0, 8)}... (full: ${path.join(LINKS_DIR, "shared-secret")})`, "info");
 		}
 
+		addLink(link);
 		c.ui.notify(`🔗 Link created: ${linkId} (${meta.sessionName})${httpPort ? ` [HTTP :${httpPort}]` : ""}`, "success");
 		updateWidget();
 	}
 
 	async function cmdJoin(c: ExtensionContext): Promise<void> {
-		if (state.mode !== "none") { c.ui.notify("Already linked. /link disconnect first.", "warning"); return; }
-
 		const filtered = discoverLinks().filter((l) => l.meta.sessionId !== state.meta.sessionId);
 
 		if (filtered.length === 0) {
@@ -936,35 +1042,46 @@ export default function (pi: ExtensionAPI) {
 		const selected = filtered[labels.indexOf(choice)];
 		if (!selected) { c.ui.notify("Link not found", "error"); return; }
 
+		const link = createInitialState();
 		const socket = new net.Socket();
 		socket.setTimeout(SOCKET_TIMEOUT_MS);
 
-		socket.on("data", handleData);
-		socket.on("close", () => { state.isConnected = false; state.connection = undefined; stopHeartbeat(); c.ui.notify("🔗 Link closed", "warning"); cleanup(); });
-		socket.on("error", (err) => { console.error("Link error:", err.message); c.ui.notify(`Connection failed: ${err.message}`, "error"); state.mode = "none"; updateWidget(); });
-		socket.on("timeout", () => { c.ui.notify("Link timed out", "warning"); socket.destroy(); cleanup(); });
+		socket.on("data", (data) => handleDataForLink(link, data));
+		socket.on("close", () => {
+			link.isConnected = false;
+			link.connection = undefined;
+			stopHeartbeatForLink(link);
+			c.ui.notify("🔗 Link closed", "warning");
+			cleanupLink(link);
+		});
+		socket.on("error", (err) => {
+			console.error("Link error:", err.message);
+			c.ui.notify(`Connection failed: ${err.message}`, "error");
+			removeLink(link.linkId);
+			updateWidget();
+		});
+		socket.on("timeout", () => { c.ui.notify("Link timed out", "warning"); socket.destroy(); cleanupLink(link); });
 
 		await new Promise<void>((resolve, reject) => { socket.connect(selected.socketPath, () => resolve()); socket.on("error", reject); });
 
-		state.mode = "guest";
-		state.linkId = selected.meta.id;
-		state.socketPath = selected.socketPath;
-		state.meta = selected.meta;
-		state.connection = socket;
-		state.isConnected = true;
-		state.buffer = "";
-		state.lastPeerActivity = Date.now();
+		link.mode = "guest";
+		link.transport = "uds";
+		link.linkId = selected.meta.id;
+		link.socketPath = selected.socketPath;
+		link.meta = selected.meta;
+		link.connection = socket;
+		link.isConnected = true;
+		link.buffer = "";
+		link.lastPeerActivity = Date.now();
 
-		sendJsonRpc(socket, createJsonRpc("ping", { sessionId: state.meta.sessionId, sessionName: state.meta.sessionName }));
-		startHeartbeat();
+		addLink(link);
+		sendJsonRpc(socket, createJsonRpc("ping", { sessionId: link.meta.sessionId, sessionName: link.meta.sessionName }));
+		startHeartbeatForLink(link);
 		c.ui.notify(`🔗 Connected to ${selected.meta.sessionName}`, "success");
 		updateWidget();
 	}
 
 	async function cmdJoinHttp(url: string, c: ExtensionContext): Promise<void> {
-		if (state.mode !== "none") { c.ui.notify("Already linked. /link disconnect first.", "warning"); return; }
-
-		// Get shared secret
 		let secret = getLinkSecret();
 		if (!secret) {
 			c.ui.notify("No shared secret found. Set PI_LINK_SECRET env var or create ~/.pi/links/shared-secret on both machines.", "warning");
@@ -982,58 +1099,108 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function cmdList(c: ExtensionContext): void {
-		const localLinks = discoverLinks().filter((l) => l.meta.sessionId !== state.meta.sessionId);
-
 		const lines: string[] = [];
-		if (state.mode !== "none") {
-			lines.push(`Active: ${state.transport.toUpperCase()} → ${state.meta.sessionName} (${state.linkId.slice(0, 8)})`);
-			if (state.transport === "http" && state.httpPort) {
-				lines.push(`  HTTP port: ${state.httpPort}`);
+
+		if (linksRegistry.size === 0) {
+			const localLinks = discoverLinks().filter((l) => l.meta.sessionId !== state.meta.sessionId);
+			if (localLinks.length > 0) {
+				lines.push(`No active links. ${localLinks.length} local UDS link(s) available.`);
+				for (const l of localLinks) {
+					const status = l.meta.status === "connected" ? "🔴 busy" : "🟢 idle";
+					lines.push(`  ${l.meta.sessionName} (${l.meta.model}) ${status} — ${l.meta.id.slice(0, 8)}`);
+				}
+			} else {
+				lines.push("No active links.");
 			}
+			lines.push("\nTo join a remote link: /link http://host:port");
+			c.ui.notify(lines.join("\n"), "info");
+			return;
 		}
 
-		if (localLinks.length > 0) {
-			lines.push(`\nLocal UDS links (${localLinks.length}):`);
-			for (const l of localLinks) {
-				const status = l.meta.status === "connected" ? "🔴 busy" : "🟢 idle";
-				lines.push(`  ${l.meta.sessionName} (${l.meta.model}) ${status} — ${l.meta.id.slice(0, 8)}`);
+		let i = 0;
+		for (const [id, link] of linksRegistry) {
+			const isActive = id === state.linkId;
+			const prefix = isActive ? "→ " : "  ";
+			const transport = link.transport === "http" ? " [HTTP]" : " [UDS]";
+			const connStatus = link.isConnected ? "🟢 connected" : "🔴 disconnected";
+
+			lines.push(`${prefix}[${i}] ${link.meta.sessionName}${transport} ${connStatus} (${id.slice(0, 8)})`);
+			if (link.peerInfo?.sessionName) lines.push(`    peer: ${link.peerInfo.sessionName}`);
+			if (link.transport === "http") {
+				if (link.httpPort) lines.push(`    HTTP port: ${link.httpPort}`);
+				if (link.httpRemoteUrl) lines.push(`    remote: ${link.httpRemoteUrl}`);
 			}
-		} else {
-			lines.push("\nNo local UDS links available.");
+			i++;
 		}
 
-		lines.push("\nTo join a remote link: /link http://host:port");
+		lines.push(`\nActive link: ${state.linkId ? state.meta.sessionName : "none"}`);
+		lines.push("To switch: /link switch <index>");
 		c.ui.notify(lines.join("\n"), "info");
 	}
 
 	function cmdStatus(c: ExtensionContext): void {
-		if (state.mode === "none") {
+		const link = getActiveLink();
+		if (!link) {
 			const available = discoverLinks();
 			c.ui.notify(available.length === 0 ? "No active links." : `${available.length} link(s) available. /link to join.`, "info");
 			return;
 		}
 
 		const lines = [
-			`Mode: ${state.mode} (${state.isConnected ? "connected" : "disconnected"})`,
-			`Transport: ${state.transport.toUpperCase()}`,
-			`Link ID: ${state.linkId}`,
-			`Session: ${state.meta.sessionName}`,
-			`Model: ${state.meta.model}`,
+			`Mode: ${link.mode} (${link.isConnected ? "connected" : "disconnected"})`,
+			`Transport: ${link.transport.toUpperCase()}`,
+			`Link ID: ${link.linkId}`,
+			`Session: ${link.meta.sessionName}`,
+			`Model: ${link.meta.model}`,
 		];
-		if (state.transport === "http") {
-			if (state.httpPort) lines.push(`HTTP port: ${state.httpPort}`);
-			if (state.httpRemoteUrl) lines.push(`Remote URL: ${state.httpRemoteUrl}`);
+		if (link.transport === "http") {
+			if (link.httpPort) lines.push(`HTTP port: ${link.httpPort}`);
+			if (link.httpRemoteUrl) lines.push(`Remote URL: ${link.httpRemoteUrl}`);
 		}
-		if (state.recovering) lines.push(`Status: recovering...`);
-		if (state.peerInfo?.sessionName) lines.push(`Peer: ${state.peerInfo.sessionName}`);
-		if (state.peerInfo?.model) lines.push(`Peer model: ${state.peerInfo.model}`);
+		if (link.recovering) lines.push(`Status: recovering...`);
+		if (link.peerInfo?.sessionName) lines.push(`Peer: ${link.peerInfo.sessionName}`);
+		if (link.peerInfo?.model) lines.push(`Peer model: ${link.peerInfo.model}`);
+
+		if (linksRegistry.size > 1) {
+			lines.push(`\nTotal links: ${linksRegistry.size}`);
+		}
+
 		c.ui.notify(lines.join("\n"), "info");
 	}
 
-	function cmdDisconnect(c: ExtensionContext): void {
-		if (state.mode === "none") { c.ui.notify("Not linked", "info"); return; }
+	function cmdDisconnect(args: string, c: ExtensionContext): void {
+		if (linksRegistry.size === 0) { c.ui.notify("Not linked", "info"); return; }
+
+		// /link disconnect [id_or_index]
+		const target = args.trim();
+		if (target) {
+			// Try to find by ID prefix or index
+			let foundLink: LinkState | undefined;
+			for (const [id, link] of linksRegistry) {
+				if (id.startsWith(target)) { foundLink = link; break; }
+			}
+			if (!foundLink) {
+				// Try by index
+				const idx = parseInt(target, 10);
+				if (!isNaN(idx)) {
+					const links = [...linksRegistry.values()];
+					foundLink = links[idx];
+				}
+			}
+			if (foundLink) {
+				c.ui.notify(`🔗 Disconnecting ${foundLink.meta.sessionName}...`, "info");
+				cleanupLink(foundLink);
+				return;
+			}
+			c.ui.notify(`Link "${target}" not found. Use /link list to see all links.`, "error");
+			return;
+		}
+
+		// No target — disconnect active link
+		const link = getActiveLink();
+		if (!link) { c.ui.notify("Not linked", "info"); return; }
 		c.ui.notify("🔗 Disconnected", "info");
-		cleanup();
+		cleanupLink(link);
 	}
 
 	function cmdVersion(c: ExtensionContext): void {
@@ -1043,23 +1210,22 @@ export default function (pi: ExtensionAPI) {
 			const localHash = loadTimeHash;
 			const lines: string[] = [];
 
-			// Local version info
 			if (diskHash !== localHash && localHash !== "unknown") {
 				lines.push(`⚠️ You: ${LINK_VERSION} loaded:${localHash} disk:${diskHash} (STALE — /reload to update)`);
 			} else {
 				lines.push(`You: ${LINK_VERSION} (${localHash})`);
 			}
 
-			// Query peer version if connected
-			if (state.isConnected && state.connection && !state.connection.destroyed) {
+			const link = getActiveLink();
+			if (link?.isConnected && link.connection && !link.connection.destroyed) {
 				const reqId = crypto.randomUUID();
 				const timeout = setTimeout(() => {
-					state.resolveQueue.delete(reqId);
+					link.resolveQueue.delete(reqId);
 					lines.push(`Peer: (no response — may be running older version without version/get support)`);
 					c.ui.notify(lines.join("\n"), localHash !== diskHash ? "warning" : "info");
 				}, 3000);
 
-				state.resolveQueue.set(reqId, (msg: any) => {
+				link.resolveQueue.set(reqId, (msg: any) => {
 					clearTimeout(timeout);
 					const peer = msg.result;
 					if (peer?.hash) {
@@ -1073,7 +1239,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				});
 
-				sendJsonRpc(state.connection, { jsonrpc: "2.0", id: reqId, method: "version/get", params: {} });
+				sendJsonRpc(link.connection, { jsonrpc: "2.0", id: reqId, method: "version/get", params: {} });
 			} else {
 				c.ui.notify(lines.join("\n"), localHash !== diskHash ? "warning" : "info");
 			}
@@ -1088,10 +1254,10 @@ export default function (pi: ExtensionAPI) {
 		name: "link_send_task",
 		label: "Link: Send Task",
 		description: [
-			"Send a task/prompt to the linked pi session.",
+			"Send a task/prompt to a linked pi session.",
 			'Default mode is "silent" — runs headless, peer context untouched.',
 			'Use mode "visible" to inject into peer session (collaborative).',
-			'Supports both UDS (local) and HTTP (remote) transports.',
+			"Supports both UDS (local) and HTTP (remote) transports.",
 		].join(" "),
 		promptSnippet: "Send a task to a linked pi session for cross-session collaboration",
 		parameters: Type.Object({
@@ -1099,9 +1265,15 @@ export default function (pi: ExtensionAPI) {
 			mode: Type.Optional(Type.String({ description: '"silent" (default) or "visible"', default: "silent" })),
 			include_context: Type.Optional(Type.Boolean({ description: "Include recent conversation as context", default: false })),
 			reply_to: Type.Optional(Type.String({ description: '"sender" to get result back, "none" to fire-and-forget', default: "sender" })),
+			target: Type.Optional(Type.String({ description: "Target link ID prefix, index, or session name (default: active link)" })),
 		}),
 		async execute(_id, params, _signal, onUpdate, c) {
-			if (!state.isConnected) {
+			// Resolve target link
+			let link = resolveTargetLink(params.target as string | undefined);
+			if (!link?.isConnected) {
+				if (params.target) {
+					return { content: [{ type: "text", text: `Target link "${params.target}" not found or not connected.` }], details: { connected: false }, isError: true };
+				}
 				return { content: [{ type: "text", text: "Not linked. Use /link to connect." }], details: { connected: false } };
 			}
 
@@ -1124,12 +1296,12 @@ export default function (pi: ExtensionAPI) {
 				context = recent || undefined;
 			}
 
-			onUpdate?.({ content: [{ type: "text", text: `Sending ${taskMode} task ${taskId.slice(0, 8)} to ${state.meta.sessionName}...` }] });
+			onUpdate?.({ content: [{ type: "text", text: `Sending ${taskMode} task ${taskId.slice(0, 8)} to ${link.meta.sessionName}...` }] });
 
 			// HTTP transport: synchronous request-response
-			if (state.transport === "http" && state.httpRemoteUrl && state.httpSecret) {
+			if (link.transport === "http" && link.httpRemoteUrl && link.httpSecret) {
 				try {
-					const response = await httpPostRpc(state.httpRemoteUrl, state.httpSecret, createJsonRpc("task/send", {
+					const response = await httpPostRpc(link.httpRemoteUrl, link.httpSecret, createJsonRpc("task/send", {
 						taskId,
 						prompt: params.prompt,
 						context,
@@ -1141,14 +1313,14 @@ export default function (pi: ExtensionAPI) {
 					if (result?.status === "completed" && result.content) {
 						return {
 							content: [{ type: "text", text: result.content }],
-							details: { taskId, peer: state.meta.sessionName, mode: taskMode, sent: true, content: result.content },
+							details: { taskId, peer: link.meta.sessionName, mode: taskMode, sent: true, content: result.content },
 						};
 					}
 
 					const badge = taskMode === "visible" ? "👁" : "🔇";
 					return {
-						content: [{ type: "text", text: `Task ${taskId.slice(0, 8)} sent to ${state.meta.sessionName} (${badge}). Status: ${result?.status ?? "unknown"}` }],
-						details: { taskId, peer: state.meta.sessionName, mode: taskMode, sent: true },
+						content: [{ type: "text", text: `Task ${taskId.slice(0, 8)} sent to ${link.meta.sessionName} (${badge}). Status: ${result?.status ?? "unknown"}` }],
+						details: { taskId, peer: link.meta.sessionName, mode: taskMode, sent: true },
 						terminate: taskMode === "silent",
 					};
 				} catch (err: any) {
@@ -1161,7 +1333,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// UDS transport: async message
-			const conn = state.connection;
+			const conn = link.connection;
 			if (!conn || conn.destroyed) {
 				return { content: [{ type: "text", text: "Connection lost." }], details: { connected: false }, isError: true };
 			}
@@ -1177,8 +1349,8 @@ export default function (pi: ExtensionAPI) {
 			const willReply = wantReply;
 			const badge = taskMode === "visible" ? "👁" : "🔇";
 			return {
-				content: [{ type: "text", text: `Task ${taskId.slice(0, 8)} sent to ${state.meta.sessionName} (${badge}).${willReply ? " Result will return." : " Fire-and-forget."}` }],
-				details: { taskId, peer: state.meta.sessionName, mode: taskMode, replyTo: params.reply_to, sent: true },
+				content: [{ type: "text", text: `Task ${taskId.slice(0, 8)} sent to ${link.meta.sessionName} (${badge}).${willReply ? " Result will return." : " Fire-and-forget."}` }],
+				details: { taskId, peer: link.meta.sessionName, mode: taskMode, replyTo: params.reply_to, sent: true },
 				terminate: taskMode === "silent",
 			};
 		},
@@ -1186,7 +1358,8 @@ export default function (pi: ExtensionAPI) {
 			const preview = ((args.prompt as string) ?? "...").slice(0, 60);
 			const mode = args.mode === "visible" ? theme.fg("warning", "👁") : theme.fg("dim", "🔇");
 			const reply = args.reply_to === "sender" ? theme.fg("accent", "↩") : theme.fg("dim", "→");
-			return new Text(theme.fg("toolTitle", theme.bold("link ")) + `${mode} ${reply} ` + theme.fg("dim", preview), 0, 0);
+			const target = args.target ? ` ${theme.fg("dim", `→${args.target}`)}` : "";
+			return new Text(theme.fg("toolTitle", theme.bold("link ")) + `${mode} ${reply}${target} ` + theme.fg("dim", preview), 0, 0);
 		},
 		renderResult(result, _opts, theme) {
 			const d = result.details as { taskId?: string; peer?: string; sent?: boolean; mode?: string } | undefined;
@@ -1196,28 +1369,62 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	/** Resolve a target link by ID prefix, index, or session name. */
+	function resolveTargetLink(target: string | undefined): LinkState | undefined {
+		if (!target) return getActiveLink();
+
+		// By ID prefix
+		for (const [id, link] of linksRegistry) {
+			if (id.startsWith(target)) return link;
+		}
+
+		// By session name
+		for (const link of linksRegistry.values()) {
+			if (link.meta.sessionName === target) return link;
+		}
+
+		// By peer session name
+		for (const link of linksRegistry.values()) {
+			if (link.peerInfo?.sessionName === target) return link;
+		}
+
+		// By index
+		const idx = parseInt(target, 10);
+		if (!isNaN(idx)) {
+			const links = [...linksRegistry.values()];
+			return links[idx];
+		}
+
+		return undefined;
+	}
+
 	pi.registerTool({
 		name: "link_status",
 		label: "Link: Status",
 		description: "Check the current link connection status and peer information.",
 		parameters: Type.Object({}),
 		async execute() {
-			const info: Record<string, unknown> = {
-				mode: state.mode,
-				transport: state.transport,
-				connected: state.isConnected,
-				linkId: state.linkId,
-				sessionName: state.meta.sessionName,
-				model: state.meta.model,
-				peer: state.peerInfo,
-			};
-			if (state.transport === "http") {
-				if (state.httpPort) info.httpPort = state.httpPort;
-				if (state.httpRemoteUrl) info.httpRemoteUrl = state.httpRemoteUrl;
+			const allLinks: Record<string, unknown>[] = [];
+			for (const [id, link] of linksRegistry) {
+				const info: Record<string, unknown> = {
+					id: id.slice(0, 8),
+					mode: link.mode,
+					transport: link.transport,
+					connected: link.isConnected,
+					sessionName: link.meta.sessionName,
+					model: link.meta.model,
+					active: id === state.linkId,
+					peer: link.peerInfo,
+				};
+				if (link.transport === "http") {
+					if (link.httpPort) info.httpPort = link.httpPort;
+					if (link.httpRemoteUrl) info.httpRemoteUrl = link.httpRemoteUrl;
+				}
+				allLinks.push(info);
 			}
 			return {
-				content: [{ type: "text", text: JSON.stringify(info, null, 2) }],
-				details: info,
+				content: [{ type: "text", text: JSON.stringify({ totalLinks: allLinks.length, activeLink: state.linkId?.slice(0, 8), links: allLinks }, null, 2) }],
+				details: { totalLinks: allLinks.length, links: allLinks },
 			};
 		},
 	});
