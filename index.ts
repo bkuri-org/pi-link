@@ -27,6 +27,7 @@ import {
 	LINKS_DIR,
 	STALE_THRESHOLD_MS,
 	HEARTBEAT_INTERVAL_MS,
+	HEARTBEAT_TIMEOUT_MS,
 	SOCKET_TIMEOUT_MS,
 	type LinkMeta,
 	type JsonRpcMessage,
@@ -87,6 +88,7 @@ export default function (pi: ExtensionAPI) {
 	// ─── Socket ────────────────────────────────────────────────────────────
 
 	function handleData(data: Buffer): void {
+		state.lastPeerActivity = Date.now();
 		state.buffer += data.toString();
 		const { messages, remaining } = parseJsonRpcLines(state.buffer);
 		state.buffer = remaining;
@@ -201,10 +203,36 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(prompt, { deliverAs: "steer" });
 	}
 
+	function handlePeerLost(reason: string): void {
+		stopHeartbeat();
+		if (state.connection) { state.connection.destroy(); state.connection = undefined; }
+		state.isConnected = false;
+
+		if (state.mode === "host") {
+			state.meta.status = "waiting";
+			writeMeta(path.join(LINKS_DIR, state.linkId), state.meta);
+		} else {
+			state.mode = "none";
+			state.linkId = "";
+			state.socketPath = "";
+			state.meta.status = "waiting";
+		}
+
+		ctx?.ui.notify(`🔗 Peer lost: ${reason}`, "warning");
+		updateWidget();
+	}
+
 	function startHeartbeat(): void {
+		state.lastPeerActivity = Date.now();
 		state.heartbeatTimer = setInterval(() => {
 			const conn = state.connection;
 			if (!conn || conn.destroyed) return;
+
+			// Detect half-open connection
+			if (state.lastPeerActivity > 0 && Date.now() - state.lastPeerActivity > HEARTBEAT_TIMEOUT_MS) {
+				handlePeerLost("heartbeat timeout — no response from peer");
+				return;
+			}
 
 			sendJsonRpc(conn, createJsonRpc("ping", {
 				sessionId: state.meta.sessionId,
@@ -212,7 +240,7 @@ export default function (pi: ExtensionAPI) {
 			}));
 			state.meta.lastHeartbeat = Date.now();
 
-			if (state.mode === "host") {
+			if (state.mode === "host" && state.isConnected) {
 				writeMeta(path.join(LINKS_DIR, state.linkId), state.meta);
 			}
 		}, HEARTBEAT_INTERVAL_MS);
@@ -358,14 +386,15 @@ export default function (pi: ExtensionAPI) {
 			state.connection = socket;
 			state.isConnected = true;
 			state.buffer = "";
+			state.lastPeerActivity = Date.now();
 			state.meta.status = "connected";
 			writeMeta(linkDir, state.meta);
 
 			socket.on("data", handleData);
 			socket.on("close", () => {
+				stopHeartbeat();
 				state.isConnected = false;
 				state.connection = undefined;
-				stopHeartbeat();
 				state.meta.status = "waiting";
 				writeMeta(linkDir, state.meta);
 				c.ui.notify("🔗 Peer disconnected", "warning");
@@ -437,6 +466,7 @@ export default function (pi: ExtensionAPI) {
 		state.connection = socket;
 		state.isConnected = true;
 		state.buffer = "";
+		state.lastPeerActivity = Date.now();
 
 		sendJsonRpc(socket, createJsonRpc("ping", { sessionId: state.meta.sessionId, sessionName: state.meta.sessionName }));
 		startHeartbeat();
