@@ -137,6 +137,7 @@ export function discoverLinks(): DiscoveredLink[] {
 		const entries = fs.readdirSync(LINKS_DIR, { withFileTypes: true });
 		for (const entry of entries) {
 			if (!entry.isDirectory()) continue;
+			if (entry.name.startsWith("__test_")) continue; // skip test artifacts
 			const dir = path.join(LINKS_DIR, entry.name);
 			const meta = readMeta(dir);
 			if (!meta) continue;
