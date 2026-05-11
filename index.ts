@@ -715,7 +715,11 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const content = fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "extensions", "link", "index.ts"), "utf-8");
 			const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 8);
-			c.ui.notify(`link extension ${LINK_VERSION} (${hash})`, "info");
+			if (hash !== loadTimeHash && loadTimeHash !== "unknown") {
+				c.ui.notify(`link extension ${LINK_VERSION} — loaded: ${loadTimeHash}, disk: ${hash} (STALE — /reload to update)`, "warning");
+			} else {
+				c.ui.notify(`link extension ${LINK_VERSION} (${hash})`, "info");
+			}
 		} catch {
 			c.ui.notify(`link extension ${LINK_VERSION}`, "info");
 		}
