@@ -82,6 +82,9 @@ export default function (pi: ExtensionAPI) {
 	let state = createInitialState(); // active link (backward compat)
 	let ctx: ExtensionContext | undefined;
 
+	// Stream buffers: taskId → accumulated content
+	const streamBuffers = new Map<string, string>();
+
 	function setActiveLink(id: string): void {
 		const link = linksRegistry.get(id);
 		if (link) state = link;
@@ -267,6 +270,34 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Incoming stream chunk
+		if (msg.method === "task/stream") {
+			const p = msg.params as { taskId: string; chunk: string; done: boolean } | undefined;
+			if (!p) return;
+
+			if (p.done) {
+				streamBuffers.delete(p.taskId);
+				if (streamBuffers.size === 0) {
+					ctx?.ui.setWidget("link-stream", undefined);
+				}
+				return;
+			}
+
+			if (p.chunk) {
+				const existing = streamBuffers.get(p.taskId) ?? "";
+				streamBuffers.set(p.taskId, existing + p.chunk);
+
+				// Show streaming progress in widget
+				const content = streamBuffers.get(p.taskId) ?? "";
+				const preview = content.length > 300 ? "..." + content.slice(-300) : content;
+				ctx?.ui.setWidget("link-stream", [
+					`⏳ Streaming (${p.taskId.slice(0, 8)})`,
+					`  ${preview.split("\n").slice(-3).join("\n")}`,
+				]);
+			}
+			return;
+		}
+
 		// Incoming task result
 		if (!msg.method && msg.result && typeof msg.result === "object") {
 			const r = msg.result as { taskId?: string; status?: string; content?: string };
@@ -285,10 +316,11 @@ export default function (pi: ExtensionAPI) {
 
 	async function processSilentTaskForLink(
 		link: LinkState,
-		p: { taskId: string; prompt: string; context?: string; replyTo?: string },
+		p: { taskId: string; prompt: string; context?: string; replyTo?: string; stream?: boolean },
 	): Promise<void> {
 		const shouldReply = p.replyTo === "sender";
-		ctx?.ui.notify(`📥 Silent task: ${p.prompt.slice(0, 60)}...`, "info");
+		const shouldStream = p.stream === true && link.connection && !link.connection.destroyed;
+		ctx?.ui.notify(`📥 Silent task: ${p.prompt.slice(0, 60)}...${shouldStream ? " [streaming]" : ""}`, "info");
 
 		const ourContext = ctx ? buildContextSnapshot(() => ctx!.sessionManager.getBranch()) : undefined;
 		let fullContext: string | undefined;
@@ -300,7 +332,28 @@ export default function (pi: ExtensionAPI) {
 			fullContext = ourContext;
 		}
 
-		const result = await runSilentTask(p.prompt, fullContext, ctx?.cwd ?? process.cwd(), link.meta.model);
+		const result = await runSilentTask(p.prompt, fullContext, ctx?.cwd ?? process.cwd(), link.meta.model,
+			shouldStream
+				? (chunk: string) => {
+					sendJsonRpc(link.connection!, {
+						jsonrpc: "2.0",
+						id: crypto.randomUUID(),
+						method: "task/stream",
+						params: { taskId: p.taskId, chunk, done: false },
+					});
+				  }
+				: undefined,
+		);
+
+		// Send stream done signal
+		if (shouldStream) {
+			sendJsonRpc(link.connection!, {
+				jsonrpc: "2.0",
+				id: crypto.randomUUID(),
+				method: "task/stream",
+				params: { taskId: p.taskId, chunk: "", done: true },
+			});
+		}
 
 		if (shouldReply) {
 			const conn = link.connection;
@@ -414,6 +467,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		linksRegistry.clear();
+		streamBuffers.clear();
 		state = createInitialState();
 		updateWidget();
 	}
@@ -1266,6 +1320,7 @@ export default function (pi: ExtensionAPI) {
 			include_context: Type.Optional(Type.Boolean({ description: "Include recent conversation as context", default: false })),
 			reply_to: Type.Optional(Type.String({ description: '"sender" to get result back, "none" to fire-and-forget', default: "sender" })),
 			target: Type.Optional(Type.String({ description: "Target link ID prefix, index, or session name (default: active link)" })),
+			stream: Type.Optional(Type.Boolean({ description: "Stream intermediate results back (UDS transport only)", default: false })),
 		}),
 		async execute(_id, params, _signal, onUpdate, c) {
 			// Resolve target link
@@ -1307,6 +1362,7 @@ export default function (pi: ExtensionAPI) {
 						context,
 						mode: taskMode,
 						replyTo: params.reply_to ?? "sender",
+						stream: false, // HTTP: streaming not supported (would need SSE)
 					}));
 
 					const result = response.result as any;
@@ -1344,14 +1400,17 @@ export default function (pi: ExtensionAPI) {
 				context,
 				mode: taskMode,
 				replyTo: params.reply_to ?? "sender",
+				stream: params.stream === true,
 			}));
 
 			const willReply = wantReply;
+			const isStreaming = params.stream === true;
 			const badge = taskMode === "visible" ? "👁" : "🔇";
+			const streamBadge = isStreaming ? " 📡" : "";
 			return {
-				content: [{ type: "text", text: `Task ${taskId.slice(0, 8)} sent to ${link.meta.sessionName} (${badge}).${willReply ? " Result will return." : " Fire-and-forget."}` }],
-				details: { taskId, peer: link.meta.sessionName, mode: taskMode, replyTo: params.reply_to, sent: true },
-				terminate: taskMode === "silent",
+				content: [{ type: "text", text: `Task ${taskId.slice(0, 8)} sent to ${link.meta.sessionName} (${badge}${streamBadge}).${willReply ? (isStreaming ? " Streaming result back." : " Result will return.") : " Fire-and-forget."}` }],
+				details: { taskId, peer: link.meta.sessionName, mode: taskMode, replyTo: params.reply_to, stream: isStreaming, sent: true },
+				terminate: taskMode === "silent" && !isStreaming,
 			};
 		},
 		renderCall(args, theme) {
@@ -1359,7 +1418,8 @@ export default function (pi: ExtensionAPI) {
 			const mode = args.mode === "visible" ? theme.fg("warning", "👁") : theme.fg("dim", "🔇");
 			const reply = args.reply_to === "sender" ? theme.fg("accent", "↩") : theme.fg("dim", "→");
 			const target = args.target ? ` ${theme.fg("dim", `→${args.target}`)}` : "";
-			return new Text(theme.fg("toolTitle", theme.bold("link ")) + `${mode} ${reply}${target} ` + theme.fg("dim", preview), 0, 0);
+			const stream = args.stream ? ` ${theme.fg("info", "📡")}` : "";
+			return new Text(theme.fg("toolTitle", theme.bold("link ")) + `${mode} ${reply}${target}${stream} ` + theme.fg("dim", preview), 0, 0);
 		},
 		renderResult(result, _opts, theme) {
 			const d = result.details as { taskId?: string; peer?: string; sent?: boolean; mode?: string } | undefined;

@@ -32,12 +32,14 @@ export function buildContextSnapshot(getBranch: () => any[]): string {
 
 /**
  * Run a task in a headless pi subprocess (silent branch — no context pollution).
+ * @param onChunk Optional callback for streaming content deltas as they arrive.
  */
 export async function runSilentTask(
 	task: string,
 	contextSnapshot: string | undefined,
 	cwd: string,
 	model: string | undefined,
+	onChunk?: (chunk: string) => void,
 ): Promise<{ output: string; error?: string }> {
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (model) args.push("--model", model);
@@ -63,6 +65,7 @@ export async function runSilentTask(
 		let buffer = "";
 		let stderr = "";
 		let lastAssistantText = "";
+		const isStreaming = !!onChunk;
 
 		proc.stdout.on("data", (data) => {
 			buffer += data.toString();
@@ -74,12 +77,22 @@ export async function runSilentTask(
 				let event: any;
 				try { event = JSON.parse(line); } catch { continue; }
 
-				if (event.type === "message_end" && event.message?.role === "assistant") {
-					const content = (event.message.content as Array<{ type: string; text?: string }>) ?? [];
-					lastAssistantText = content
-						.filter((c) => c.type === "text")
-						.map((c) => c.text ?? "")
-						.join("");
+				// Streaming: capture content deltas as they arrive
+				if (event.type === "content_block_delta") {
+					const delta = event.delta;
+					if (delta?.type === "text_delta" && delta.text) {
+						lastAssistantText += delta.text;
+						onChunk?.(delta.text);
+					}
+				} else if (event.type === "message_end" && event.message?.role === "assistant") {
+					// Only use message_end content if we weren't streaming deltas
+					if (!isStreaming) {
+						const content = (event.message.content as Array<{ type: string; text?: string }>) ?? [];
+						lastAssistantText = content
+							.filter((c) => c.type === "text")
+							.map((c) => c.text ?? "")
+							.join("");
+					}
 				}
 			}
 		});
