@@ -51,6 +51,16 @@ import { buildContextSnapshot, runSilentTask } from "./headless.js";
 
 const LINK_VERSION = "v0.1.0";
 
+// Compute content hash at load time for cache-bust detection
+const EXTENSION_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "link");
+function computeHash(): string {
+	try {
+		const content = fs.readFileSync(path.join(EXTENSION_DIR, "index.ts"), "utf-8");
+		return crypto.createHash("sha256").update(content).digest("hex").slice(0, 8);
+	} catch { return "unknown"; }
+}
+const loadTimeHash = computeHash();
+
 export default function (pi: ExtensionAPI) {
 	let state = createInitialState();
 	let ctx: ExtensionContext | undefined;
@@ -274,10 +284,10 @@ export default function (pi: ExtensionAPI) {
 		if (state.mode === "host" && state.linkId) {
 			cleanupLinkDir(path.join(LINKS_DIR, state.linkId));
 		}
-		// Note: do NOT delete recovery data here — session_shutdown saves it before
-		// calling cleanup(). Recovery data is cleaned up by attemptRecovery() and ages
-		// out via STALE_THRESHOLD_MS. Intentional disconnects call deleteRecoveryData
-		// explicitly in cmdDisconnect().
+		// Clear recovery data on clean disconnect
+		if (state.meta.sessionId) {
+			deleteRecoveryData(state.meta.sessionId);
+		}
 		state = createInitialState();
 		updateWidget();
 	}
@@ -456,6 +466,15 @@ export default function (pi: ExtensionAPI) {
 		state.meta.sessionId = sessionFile ?? crypto.randomUUID();
 		state.meta.sessionName = pi.getSessionName() ?? path.basename(sessionFile ?? "unnamed", ".jsonl");
 		state.meta.model = c.model ? `${c.model.provider}/${c.model.id}` : "unknown";
+
+		// Check if extension files changed since load (jiti cache stale)
+		const currentHash = computeHash();
+		if (currentHash !== loadTimeHash && loadTimeHash !== "unknown") {
+			c.ui.notify(
+				`⚠️ Link extension changed on disk (${loadTimeHash} → ${currentHash}). Run /reload to pick up changes.`,
+				"warning",
+			);
+		}
 
 		// Attempt to recover a link after reload
 		if ((event as any).reason === "reload") {
@@ -688,10 +707,6 @@ export default function (pi: ExtensionAPI) {
 
 	function cmdDisconnect(c: ExtensionContext): void {
 		if (state.mode === "none") { c.ui.notify("Not linked", "info"); return; }
-		// Intentional disconnect — clear recovery data so reload doesn't re-establish
-		if (state.meta.sessionId) {
-			deleteRecoveryData(state.meta.sessionId);
-		}
 		c.ui.notify("🔗 Disconnected", "info");
 		cleanup();
 	}
