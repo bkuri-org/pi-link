@@ -231,52 +231,41 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const lines: string[] = [];
 		const activityStr = formatActivity(link);
 
 		if (link.mode === "host") {
 			if (link.recovering) {
-				lines.push(`🔗 Recovering link...`, `  ${link.meta.sessionName}`);
+				ctx!.ui.setWidget("link", [`🔗 Recovering link...`, `  ${link.meta.sessionName}`]);
 				ctx!.ui.setStatus("link", "🔗 recovering...");
 			} else if (link.isConnected) {
 				const peer = link.peerInfo?.sessionName ?? "peer";
 				const transport = link.transport === "http" ? ` [HTTP :${link.httpPort}]` : "";
-				lines.push(`🔗 Linked (host) → ${peer}`, `  ${link.meta.model}${transport}`);
+				const lines = [`🔗 Linked (host) → ${peer}`, `  ${link.meta.model}${transport}`];
 				if (activityStr) lines.push(activityStr);
-				const log = formatActivityLog(link);
-				if (log.length > 0) {
-					lines.push("", "  Recent activity:");
-					lines.push(...log.slice(-3));
-				}
+				ctx!.ui.setWidget("link", lines);
 				ctx!.ui.setStatus("link", `🔗 ${formatActivity(link, true) || peer}`);
 			} else {
 				const transport = link.transport === "http" ? ` [HTTP :${link.httpPort}]` : "";
-				lines.push(`🔗 Waiting for peer...${transport}`, `  ${link.meta.sessionName}`, `  ${link.meta.model}`);
+				ctx!.ui.setWidget("link", [`🔗 Waiting for peer...${transport}`, `  ${link.meta.sessionName}`, `  ${link.meta.model}`]);
 				ctx!.ui.setStatus("link", "🔗 waiting...");
 			}
 		} else {
 			// guest
 			if (link.recovering) {
-				lines.push(`🔗 Recovering link...`, `  ${link.meta.sessionName}`);
+				ctx!.ui.setWidget("link", [`🔗 Recovering link...`, `  ${link.meta.sessionName}`]);
 				ctx!.ui.setStatus("link", "🔗 recovering...");
 			} else if (link.isConnected) {
 				const peer = link.meta.sessionName || link.meta.id;
 				const transport = link.transport === "http" ? " [HTTP]" : "";
-				lines.push(`🔗 Linked (guest) → ${peer}${transport}`, `  ${link.peerInfo?.model ?? ""}`);
+				const lines = [`🔗 Linked (guest) → ${peer}${transport}`, `  ${link.peerInfo?.model ?? ""}`];
 				if (activityStr) lines.push(activityStr);
-				const log = formatActivityLog(link);
-				if (log.length > 0) {
-					lines.push("", "  Recent activity:");
-					lines.push(...log.slice(-3));
-				}
+				ctx!.ui.setWidget("link", lines);
 				ctx!.ui.setStatus("link", `🔗 ${formatActivity(link, true) || peer}`);
 			} else {
 				ctx!.ui.setWidget("link", undefined);
 				ctx!.ui.setStatus("link", undefined);
 			}
 		}
-
-		ctx!.ui.setWidget("link", lines.length > 0 ? lines : undefined);
 	}
 
 	// ─── Per-link message handling ─────────────────────────────────────────
