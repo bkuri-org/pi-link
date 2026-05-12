@@ -65,7 +65,7 @@ import {
 import type { LinkActivity } from "./types.js";
 import { buildContextSnapshot, runSilentTask } from "./headless.js";
 
-const LINK_VERSION = "v0.2.0";
+const LINK_VERSION = "v1.0.0";
 
 // Compute content hash at load time for cache-bust detection
 const EXTENSION_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "link");
