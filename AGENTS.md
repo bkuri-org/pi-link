@@ -8,6 +8,11 @@ Two task modes:
 - **Silent** (default) — spawns a headless `pi --mode json` subprocess, peer context stays clean
 - **Visible** — injects into the peer's session, both agents share context
 
+Three link roles (shown in widget with arrows):
+- **Symmetric** (`🔗 ↔`) — default, both sides equal, both can send tasks
+- **Interviewer** (`🎤 →`) — creates a link where tasks flow FROM this side
+- **Interviewee** (`🎧 ←`) — receives tasks from interviewer; `/link-task` blocks unless `--force`
+
 ## Architecture
 
 ```
@@ -46,19 +51,39 @@ rm -f /tmp/jiti/extensions-link.*
 - **pi TUI**: `Text` from `@earendil-works/pi-tui` for custom rendering
 - **pi Events**: `session_start`, `session_shutdown`, `agent_end` for lifecycle hooks
 - **pi Messages**: `pi.sendMessage()` with `triggerTurn: true` for result relay
-- **pi Commands**: `pi.registerCommand()` for `/link`, `/link-task`, `/link status`, etc.
+- **pi Commands**: `pi.registerCommand()` for `/link`, `/link-task`, `/link status`, `/link role`, etc.
 - **pi Tools**: `pi.registerTool()` for `link_send_task`, `link_status` (LLM-callable)
+- **Link roles**: Interview mode via `/link interview`, role reversal via `/link role reverse`, role management via `/link role [reverse|symmetric]`
 - **Village**: Can link pi sessions to Village builder worktrees for parallel monitoring
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/link` | Auto-join or create a symmetric link |
+| `/link interview [name]` | Create an interview-mode link (🎤 → interviewee) |
+| `/link create [--interview] [--http [port]]` | Create a link with options |
+| `/link role` | Show current role |
+| `/link role reverse` | Swap interviewer/interviewee roles |
+| `/link role symmetric` | Disable interview mode, revert to 🔗 ↔ |
+| `/link-task <prompt>` | Send task to active peer (blocked for interviewees) |
+| `/link-task --force <prompt>` | Send task even as interviewee |
+| `/link-task --visible <prompt>` | Inject task into peer session |
+| `/link status` | Show connection + role info |
+| `/link list` | List all links |
+| `/link disconnect [id]` | Close a link |
+| `/link purge [--force]` | Clean up stale links |
+| `/link version` | Show version + hash |
 
 ## Project Structure
 
 ```
 pi-link-extension/
 ├── index.ts        # Commands, tools, events, socket handling, UI widgets
-├── types.ts        # LinkMeta, JsonRpcMessage, LinkState, discovery, UDS helpers
+├── types.ts        # LinkMeta, LinkRole, JsonRpcMessage, LinkState, discovery, UDS helpers
 ├── headless.ts     # Context snapshot + headless pi subprocess spawning
 ├── DESIGN.md       # Architecture doc with A2A/ACP protocol mapping
-└── test-link.ts    # Standalone tests for UDS + framing (14 tests)
+└── test-link.ts    # Standalone tests for UDS + framing (23 tests)
 ```
 
 ## Constraints

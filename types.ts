@@ -19,6 +19,25 @@ export const HTTP_TASK_TIMEOUT_MS = 300_000;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+export type LinkRole = "symmetric" | "interviewer" | "interviewee";
+
+export function maybeLinkRole(value: string | undefined): LinkRole {
+	if (value === "interviewer" || value === "interviewee") return value;
+	return "symmetric";
+}
+
+export function oppositeRole(role: LinkRole): LinkRole {
+	if (role === "interviewer") return "interviewee";
+	if (role === "interviewee") return "interviewer";
+	return "symmetric";
+}
+
+export function roleIcon(role: LinkRole): string {
+	if (role === "interviewer") return "🎤";
+	if (role === "interviewee") return "🎧";
+	return "🔗";
+}
+
 export interface LinkMeta {
 	id: string;
 	sessionId: string;
@@ -27,6 +46,7 @@ export interface LinkMeta {
 	created: number;
 	lastHeartbeat: number;
 	status: "waiting" | "connected";
+	role?: LinkRole;
 }
 
 export interface JsonRpcMessage {
@@ -67,6 +87,7 @@ export interface LinkState {
 	linkId: string;
 	socketPath: string;
 	meta: LinkMeta;
+	selfRole: LinkRole;
 	connection?: net.Socket;
 	server?: net.Server;
 	buffer: string;
@@ -91,6 +112,7 @@ export function createInitialState(): LinkState {
 		transport: "uds",
 		linkId: "",
 		socketPath: "",
+		selfRole: "symmetric",
 		meta: {
 			id: "",
 			sessionId: "",

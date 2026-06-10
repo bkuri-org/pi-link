@@ -45,6 +45,7 @@ import {
 	type LinkMeta,
 	type JsonRpcMessage,
 	type LinkState,
+	type LinkRole,
 	type LinkRecoveryData,
 	type PendingTask,
 	createInitialState,
@@ -63,6 +64,8 @@ import {
 	getLinkSecret,
 	ensureLinkSecret,
 	httpPostRpc,
+	maybeLinkRole,
+	roleIcon,
 } from "./types.js";
 import type { LinkActivity } from "./types.js";
 import { buildContextSnapshot, runSilentTask } from "./headless.js";
@@ -214,7 +217,9 @@ export default function (pi: ExtensionAPI) {
 			if (link.isConnected) {
 				const peer = link.peerInfo?.sessionName ?? link.meta.sessionName;
 				const transport = link.transport === "http" ? " [HTTP]" : "";
-				lines.push(`${prefix}🔗 ${peer}${transport}`);
+				const icon = roleIcon(link.selfRole);
+				const arrow = link.selfRole === "symmetric" ? "↔" : link.selfRole === "interviewer" ? "→" : "←";
+				lines.push(`${prefix}${icon} ${arrow} ${peer}${transport}`);
 			} else if (link.mode === "host") {
 				lines.push(`${prefix}⏳ ${link.meta.sessionName} (waiting)`);
 			} else {
@@ -226,6 +231,25 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("link", `🔗 ${connectedCount}/${linksRegistry.size}`);
 	}
 
+	function renderRoleLabel(link: LinkState): string {
+		if (link.selfRole === "symmetric") return "🔗 ↔";
+		const arrow = link.selfRole === "interviewer" ? "→" : "←";
+		return `${roleIcon(link.selfRole)} ${arrow}`;
+	}
+
+	function renderRolePeerName(link: LinkState): string {
+		if (link.selfRole === "symmetric") {
+			return link.mode === "host"
+				? (link.peerInfo?.sessionName ?? "peer")
+				: (link.meta.sessionName || link.meta.id);
+		}
+		// Interview mode: show the other side's name
+		if (link.selfRole === "interviewer") {
+			return link.peerInfo?.sessionName ?? "interviewee";
+		}
+		return link.meta.sessionName || "interviewer";
+	}
+
 	function renderSingleLinkWidget(link: LinkState): void {
 		if (link.mode === "none") {
 			ctx!.ui.setWidget("link", undefined);
@@ -234,39 +258,48 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const activityStr = formatActivity(link);
+		const widgetIcon = roleIcon(link.selfRole);
+		const roleLabel = renderRoleLabel(link);
+		const peerName = renderRolePeerName(link);
+		const transport = link.transport === "http"
+			? (link.mode === "host" ? ` [HTTP :${link.httpPort}]` : " [HTTP]")
+			: "";
 
-		if (link.mode === "host") {
-			if (link.recovering) {
-				ctx!.ui.setWidget("link", [`🔗 Recovering link...`, `  ${link.meta.sessionName}`]);
-				ctx!.ui.setStatus("link", "🔗 recovering...");
-			} else if (link.isConnected) {
-				const peer = link.peerInfo?.sessionName ?? "peer";
-				const transport = link.transport === "http" ? ` [HTTP :${link.httpPort}]` : "";
-				const lines = [`🔗 Linked (host) → ${peer}`, `  ${link.meta.model}${transport}`];
-				if (activityStr) lines.push(activityStr);
-				ctx!.ui.setWidget("link", lines);
-				ctx!.ui.setStatus("link", `🔗 ${formatActivity(link, true) || peer}`);
-			} else {
-				const transport = link.transport === "http" ? ` [HTTP :${link.httpPort}]` : "";
-				ctx!.ui.setWidget("link", [`🔗 Waiting for peer...${transport}`, `  ${link.meta.sessionName}`, `  ${link.meta.model}`]);
-				ctx!.ui.setStatus("link", "🔗 waiting...");
-			}
-		} else {
-			// guest
-			if (link.recovering) {
-				ctx!.ui.setWidget("link", [`🔗 Recovering link...`, `  ${link.meta.sessionName}`]);
-				ctx!.ui.setStatus("link", "🔗 recovering...");
-			} else if (link.isConnected) {
-				const peer = link.meta.sessionName || link.meta.id;
-				const transport = link.transport === "http" ? " [HTTP]" : "";
-				const lines = [`🔗 Linked (guest) → ${peer}${transport}`, `  ${link.peerInfo?.model ?? ""}`];
-				if (activityStr) lines.push(activityStr);
-				ctx!.ui.setWidget("link", lines);
-				ctx!.ui.setStatus("link", `🔗 ${formatActivity(link, true) || peer}`);
+		// Recovering
+		if (link.recovering) {
+			ctx!.ui.setWidget("link", [`${widgetIcon} Recovering link...`, `  ${link.meta.sessionName}`]);
+			ctx!.ui.setStatus("link", `${widgetIcon} recovering...`);
+			return;
+		}
+
+		// Waiting for peer
+		if (!link.isConnected) {
+			if (link.mode === "host") {
+				ctx!.ui.setWidget("link", [`${widgetIcon} Waiting for peer...${transport}`, `  ${link.meta.sessionName}`, `  ${link.meta.model}`]);
+				ctx!.ui.setStatus("link", `${widgetIcon} waiting...`);
 			} else {
 				ctx!.ui.setWidget("link", undefined);
 				ctx!.ui.setStatus("link", undefined);
 			}
+			return;
+		}
+
+		// Connected
+		const lines: string[] = [];
+
+		if (link.selfRole === "symmetric") {
+			lines.push(`${roleLabel} ${peerName}${transport}`);
+			lines.push(`  ${link.mode === "host" ? link.meta.model : (link.peerInfo?.model ?? "")}`);
+			if (activityStr) lines.push(activityStr);
+			ctx!.ui.setWidget("link", lines);
+			ctx!.ui.setStatus("link", `${widgetIcon} ${formatActivity(link, true) || peerName}`);
+		} else {
+			const roleName = link.selfRole === "interviewer" ? "Interviewer" : "Interviewee";
+			lines.push(`${roleLabel} ${peerName} (${roleName})${transport}`);
+			lines.push(`  ${link.mode === "host" ? link.meta.model : (link.peerInfo?.model ?? "")}`);
+			if (activityStr) lines.push(activityStr);
+			ctx!.ui.setWidget("link", lines);
+			ctx!.ui.setStatus("link", `${widgetIcon} ${formatActivity(link, true) || peerName}`);
 		}
 	}
 
@@ -303,6 +336,7 @@ export default function (pi: ExtensionAPI) {
 						sessionName: link.meta.sessionName,
 						model: link.meta.model,
 						hash: loadTimeHash,
+						role: link.selfRole,
 					},
 				});
 			}
@@ -320,9 +354,33 @@ export default function (pi: ExtensionAPI) {
 						version: LINK_VERSION,
 						hash: loadTimeHash,
 						sessionName: link.meta.sessionName,
+						role: link.selfRole,
 					},
 				});
 			}
+			return;
+		}
+
+		// Role update (sent by peer when role reverses)
+		if (msg.method === "role/update") {
+			const p = msg.params as { role?: string } | undefined;
+			if (!p?.role) return;
+
+			const newHostRole = maybeLinkRole(p.role);
+			link.meta.role = newHostRole;
+
+			if (newHostRole === "symmetric") {
+				link.selfRole = "symmetric";
+			} else if (link.mode === "host") {
+				// Host's selfRole matches meta.role
+				link.selfRole = newHostRole;
+			} else {
+				// Guest's selfRole is opposite of host meta.role
+				link.selfRole = newHostRole === "interviewer" ? "interviewee" : "interviewer";
+			}
+
+			updateWidget();
+			ctx?.ui.notify(`🔗 Role updated: you're now ${roleIcon(link.selfRole)} ${link.selfRole}`, "info");
 			return;
 		}
 
@@ -651,6 +709,7 @@ export default function (pi: ExtensionAPI) {
 					sessionName: link.meta.sessionName,
 					model: link.meta.model,
 					hash: loadTimeHash,
+					role: link.selfRole,
 				},
 			};
 		}
@@ -660,7 +719,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				jsonrpc: "2.0",
 				id: msg.id,
-				result: { version: LINK_VERSION, hash: loadTimeHash, sessionName: link.meta.sessionName },
+				result: { version: LINK_VERSION, hash: loadTimeHash, sessionName: link.meta.sessionName, role: link.selfRole },
 			};
 		}
 
@@ -755,6 +814,9 @@ export default function (pi: ExtensionAPI) {
 			lastHeartbeat: Date.now(),
 			status: "connected",
 		};
+		const remoteRole = maybeLinkRole(pingResponse.result?.role as string | undefined);
+		link.meta.role = remoteRole;
+		link.selfRole = remoteRole === "interviewer" ? "interviewee" : remoteRole === "interviewee" ? "interviewer" : "symmetric";
 		link.peerInfo = {
 			sessionId: pingResponse.result?.sessionId as string ?? "",
 			sessionName: pingResponse.result?.sessionName as string ?? agentInfo.name,
@@ -920,6 +982,9 @@ export default function (pi: ExtensionAPI) {
 			link.linkId = recovery.linkId;
 			link.socketPath = sockPath;
 			link.meta = hostMeta;
+			link.selfRole = maybeLinkRole(hostMeta.role);
+			if (link.selfRole === "interviewer") link.selfRole = "interviewee";
+			else if (link.selfRole === "interviewee") link.selfRole = "interviewer";
 			link.connection = socket;
 			link.isConnected = true;
 			link.recovering = false;
@@ -1018,9 +1083,9 @@ export default function (pi: ExtensionAPI) {
 	// ─── Commands ──────────────────────────────────────────────────────────
 
 	pi.registerCommand("link", {
-		description: "Manage session links (create, join, status, disconnect, purge, version, list, HTTP remote)",
+		description: "Manage session links (create, interview, join, status, role, disconnect, purge, version, list, HTTP remote)",
 		getArgumentCompletions: (prefix: string) => {
-			const cmds = ["create", "status", "disconnect", "version", "list", "purge"];
+			const cmds = ["create", "interview", "status", "role", "disconnect", "version", "list", "purge"];
 			const filtered = cmds.filter((c) => c.startsWith(prefix));
 			return filtered.length > 0 ? filtered.map((c) => ({ value: c, label: c })) : null;
 		},
@@ -1033,7 +1098,9 @@ export default function (pi: ExtensionAPI) {
 
 			switch (sub) {
 				case "create": return cmdCreate(rest, c);
+				case "interview": return cmdCreate("--interview " + rest, c);
 				case "status": return cmdStatus(c);
+				case "role": return cmdRole(rest, c);
 				case "disconnect": return cmdDisconnect(rest, c);
 				case "version": return cmdVersion(c);
 				case "list": return cmdList(c);
@@ -1043,23 +1110,37 @@ export default function (pi: ExtensionAPI) {
 					if (sub.startsWith("http://") || sub.startsWith("https://")) {
 						return cmdJoinHttp(sub, c);
 					}
-					c.ui.notify(`Unknown: ${sub}. Use: /link [create|status|disconnect|purge|version|list|http://...]`, "error");
+					c.ui.notify(`Unknown: ${sub}. Use: /link [create|interview|join|status|role|disconnect|purge|version|list|http://...]`, "error");
 			}
 		},
 	});
 
 	pi.registerCommand("link-task", {
-		description: "Send a task to the linked session (--visible to inject into peer session)",
+		description: "Send a task to the linked session (--visible to inject, --force to override interview mode guard)",
 		handler: async (args, c) => {
 			const link = getActiveLink();
 			if (!link?.isConnected) { c.ui.notify("Not linked. Use /link to connect.", "warning"); return; }
 
 			const trimmed = args.trim();
-			if (!trimmed) { c.ui.notify("Usage: /link-task [--visible] <prompt>", "error"); return; }
+			if (!trimmed) { c.ui.notify("Usage: /link-task [--force] [--visible] <prompt>", "error"); return; }
 
-			const isVisible = trimmed.startsWith("--visible");
-			const prompt = isVisible ? trimmed.replace(/^--visible\s*/, "").trim() : trimmed;
-			if (!prompt) { c.ui.notify("Usage: /link-task [--visible] <prompt>", "error"); return; }
+			// Parse flags in any order
+			const force = /\B--force\b/.test(trimmed);
+			const isVisible = /\B--visible\b/.test(trimmed);
+			const prompt = trimmed.replace(/--(force|visible)\s*/g, "").trim();
+			if (!prompt) { c.ui.notify("Usage: /link-task [--force] [--visible] <prompt>", "error"); return; }
+
+			// Interview mode guard: block interviewees unless --force
+			if (link.selfRole === "interviewee" && !force) {
+				c.ui.notify(
+					`⚠️ You're the ${roleIcon("interviewee")} interviewee. ` +
+					`Tasks flow FROM the ${roleIcon("interviewer")} interviewer TO you.\n` +
+					`  To send anyway: /link-task --force <prompt>\n` +
+					`  To swap roles:  /link role reverse`,
+					"warning"
+				);
+				return;
+			}
 
 			if (link.transport === "http" && link.httpRemoteUrl && link.httpSecret) {
 				c.ui.notify("HTTP task sent via /link-task not yet supported. Use the link_send_task tool.", "warning");
@@ -1084,10 +1165,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	async function cmdCreate(args: string, c: ExtensionContext): Promise<void> {
-		// Parse --http [port] flag
+		// Parse flags: --http [port], --interview
+		const interviewMode = args.includes("--interview");
 		const httpMatch = args.match(/--http(?:\s+(\d+))?/);
 		const httpPort = httpMatch ? parseInt(httpMatch[1] || String(HTTP_LINK_DEFAULT_PORT), 10) : undefined;
-		const name = args.replace(/--http(?:\s+\d+)?/, "").trim();
+		const name = args.replace(/--http(?:\s+\d+)?/, "").replace(/--interview/, "").trim();
 
 		ensureLinksDir();
 		const linkId = generateId();
@@ -1096,6 +1178,7 @@ export default function (pi: ExtensionAPI) {
 		fs.mkdirSync(linkDir, { recursive: true });
 
 		const link = createInitialState();
+		link.selfRole = interviewMode ? "interviewer" : "symmetric";
 		const meta: LinkMeta = {
 			id: linkId,
 			sessionId: state.meta.sessionId,
@@ -1104,6 +1187,7 @@ export default function (pi: ExtensionAPI) {
 			created: Date.now(),
 			lastHeartbeat: Date.now(),
 			status: "waiting",
+			role: interviewMode ? "interviewer" : undefined,
 		};
 		link.meta = meta;
 		writeMeta(linkDir, meta);
@@ -1157,7 +1241,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		addLink(link);
-		c.ui.notify(`🔗 Link created: ${linkId} (${meta.sessionName})${httpPort ? ` [HTTP :${httpPort}]` : ""}`, "success");
+		const roleStr = interviewMode ? " 🎤 interview mode" : "";
+		c.ui.notify(`🔗 Link created: ${linkId} (${meta.sessionName})${roleStr}${httpPort ? ` [HTTP :${httpPort}]` : ""}`, "success");
 		updateWidget();
 	}
 
@@ -1173,7 +1258,8 @@ export default function (pi: ExtensionAPI) {
 			const age = Math.round((Date.now() - l.meta.created) / 1000);
 			const ageStr = age < 60 ? `${age}s` : age < 3600 ? `${Math.round(age / 60)}m` : `${Math.round(age / 3600)}h`;
 			const status = l.meta.status === "connected" ? "🔴 busy" : "🟢 idle";
-			return { dir: l.dir, label: `${l.meta.sessionName} (${l.meta.model}) ${status} — ${ageStr} ago` };
+			const roleHint = l.meta.role ? ` ${roleIcon(maybeLinkRole(l.meta.role))}` : "";
+			return { dir: l.dir, label: `${l.meta.sessionName} (${l.meta.model})${roleHint} ${status} — ${ageStr} ago` };
 		});
 
 		const labels = items.map((i) => i.label);
@@ -1210,6 +1296,10 @@ export default function (pi: ExtensionAPI) {
 		link.linkId = selected.meta.id;
 		link.socketPath = selected.socketPath;
 		link.meta = selected.meta;
+		link.selfRole = maybeLinkRole(selected.meta.role);
+		// Guest's selfRole is opposite of host's role in interview mode
+		if (link.selfRole === "interviewer") link.selfRole = "interviewee";
+		else if (link.selfRole === "interviewee") link.selfRole = "interviewer";
 		link.connection = socket;
 		link.isConnected = true;
 		link.buffer = "";
@@ -1218,7 +1308,8 @@ export default function (pi: ExtensionAPI) {
 		addLink(link);
 		sendJsonRpc(socket, createJsonRpc("ping", { sessionId: link.meta.sessionId, sessionName: link.meta.sessionName }));
 		startHeartbeatForLink(link);
-		c.ui.notify(`🔗 Connected to ${selected.meta.sessionName}`, "success");
+		const roleHint = link.selfRole !== "symmetric" ? ` (${roleIcon(link.selfRole)} ${link.selfRole})` : "";
+		c.ui.notify(`🔗 Connected to ${selected.meta.sessionName}${roleHint}`, "success");
 		updateWidget();
 	}
 
@@ -1231,8 +1322,9 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			c.ui.notify(`🔗 Connecting to ${url}...`, "info");
-			await connectHttpRemote(url, secret);
-			c.ui.notify(`🔗 Connected (HTTP) → ${state.meta.sessionName}`, "success");
+			const httpLink = await connectHttpRemote(url, secret);
+			const roleHint = httpLink.selfRole !== "symmetric" ? ` (${roleIcon(httpLink.selfRole)} ${httpLink.selfRole})` : "";
+			c.ui.notify(`🔗 Connected (HTTP) → ${state.meta.sessionName}${roleHint}`, "success");
 			updateWidget();
 		} catch (err: any) {
 			c.ui.notify(`🔗 HTTP connection failed: ${err.message}`, "error");
@@ -1248,7 +1340,8 @@ export default function (pi: ExtensionAPI) {
 				lines.push(`No active links. ${localLinks.length} local UDS link(s) available.`);
 				for (const l of localLinks) {
 					const status = l.meta.status === "connected" ? "🔴 busy" : "🟢 idle";
-					lines.push(`  ${l.meta.sessionName} (${l.meta.model}) ${status} — ${l.meta.id.slice(0, 8)}`);
+					const roleHint = l.meta.role ? ` ${roleIcon(maybeLinkRole(l.meta.role))}` : "";
+					lines.push(`  ${l.meta.sessionName} (${l.meta.model})${roleHint} ${status} — ${l.meta.id.slice(0, 8)}`);
 				}
 			} else {
 				lines.push("No active links.");
@@ -1264,8 +1357,9 @@ export default function (pi: ExtensionAPI) {
 			const prefix = isActive ? "→ " : "  ";
 			const transport = link.transport === "http" ? " [HTTP]" : " [UDS]";
 			const connStatus = link.isConnected ? "🟢 connected" : "🔴 disconnected";
+			const roleStr = link.selfRole === "symmetric" ? "" : ` ${roleIcon(link.selfRole)}`;
 
-			lines.push(`${prefix}[${i}] ${link.meta.sessionName}${transport} ${connStatus} (${id.slice(0, 8)})`);
+			lines.push(`${prefix}[${i}] ${link.meta.sessionName}${roleStr}${transport} ${connStatus} (${id.slice(0, 8)})`);
 			if (link.peerInfo?.sessionName) lines.push(`    peer: ${link.peerInfo.sessionName}`);
 			if (link.transport === "http") {
 				if (link.httpPort) lines.push(`    HTTP port: ${link.httpPort}`);
@@ -1279,6 +1373,89 @@ export default function (pi: ExtensionAPI) {
 		c.ui.notify(lines.join("\n"), "info");
 	}
 
+	async function cmdRole(args: string, c: ExtensionContext): Promise<void> {
+		const link = getActiveLink();
+		if (!link?.isConnected) { c.ui.notify("Not linked.", "warning"); return; }
+
+		const sub = args.trim().toLowerCase();
+
+		if (sub === "reverse") {
+			if (link.selfRole === "symmetric") {
+				c.ui.notify("Role reverse only applies in interview mode. Use /link interview to start.", "info");
+				return;
+			}
+
+			const newRole: LinkRole = link.selfRole === "interviewer" ? "interviewee" : "interviewer";
+
+			// Update host's meta.role to reflect new host perspective
+			if (newRole === "symmetric") {
+				link.meta.role = undefined;
+			} else {
+				// meta.role stores the host's perspective
+				link.meta.role = link.mode === "host" ? newRole : (newRole === "interviewer" ? "interviewee" : "interviewer");
+			}
+			link.selfRole = newRole;
+
+			// Notify peer
+			const conn = link.connection;
+			if (conn && !conn.destroyed) {
+				sendJsonRpc(conn, {
+					jsonrpc: "2.0",
+					id: crypto.randomUUID(),
+					method: "role/update",
+					params: { role: link.meta.role ?? "symmetric" },
+				});
+			}
+
+			// Persist to disk if host
+			if (link.mode === "host" && link.linkId) {
+				writeMeta(path.join(LINKS_DIR, link.linkId), link.meta);
+			}
+
+			updateWidget();
+			c.ui.notify(`🔗 Role reversed. You're now ${roleIcon(link.selfRole)} ${link.selfRole}.`, "success");
+			return;
+		}
+
+		if (sub === "symmetric" || sub === "off") {
+			link.meta.role = undefined;
+			link.selfRole = "symmetric";
+
+			// Notify peer
+			const conn = link.connection;
+			if (conn && !conn.destroyed) {
+				sendJsonRpc(conn, {
+					jsonrpc: "2.0",
+					id: crypto.randomUUID(),
+					method: "role/update",
+					params: { role: "symmetric" },
+				});
+			}
+
+			// Persist to disk if host
+			if (link.mode === "host" && link.linkId) {
+				writeMeta(path.join(LINKS_DIR, link.linkId), link.meta);
+			}
+
+			updateWidget();
+			c.ui.notify("🔗 Interview mode disabled. Link is now symmetric (🔗 ↔).", "success");
+			return;
+		}
+
+		if (sub === "") {
+			const roleName = link.selfRole === "symmetric" ? "symmetric" : `${roleIcon(link.selfRole)} ${link.selfRole}`;
+			c.ui.notify(
+				`Current role: ${roleName}\n` +
+				`  /link role reverse    — Swap roles (${roleIcon("interviewer")} ↔ ${roleIcon("interviewee")})\n` +
+				`  /link role symmetric  — Disable interview mode, revert to 🔗 ↔`,
+				"info"
+			);
+			return;
+		}
+
+		c.ui.notify(`Unknown: /link role ${sub}. Use: /link role [reverse|symmetric]`, "error");
+	}
+
 	function cmdStatus(c: ExtensionContext): void {
 		const link = getActiveLink();
 		if (!link) {
@@ -1287,7 +1464,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		const roleStr = link.selfRole === "symmetric" ? "🔗 symmetric" : `${roleIcon(link.selfRole)} ${link.selfRole}`;
 		const lines = [
+			`Role: ${roleStr}`,
 			`Mode: ${link.mode} (${link.isConnected ? "connected" : "disconnected"})`,
 			`Transport: ${link.transport.toUpperCase()}`,
 			`Link ID: ${link.linkId}`,
@@ -1522,6 +1701,7 @@ export default function (pi: ExtensionAPI) {
 			reply_to: Type.Optional(Type.String({ description: '"sender" to get result back, "none" to fire-and-forget', default: "sender" })),
 			target: Type.Optional(Type.String({ description: "Target link ID prefix, index, or session name (default: active link)" })),
 			stream: Type.Optional(Type.Boolean({ description: "Stream intermediate results back (UDS transport only)", default: false })),
+			force: Type.Optional(Type.Boolean({ description: "Override interview mode guard (allow interviewee to send)", default: false })),
 		}),
 		async execute(_id, params, _signal, onUpdate, c) {
 			// Resolve target link
@@ -1531,6 +1711,17 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text", text: `Target link "${params.target}" not found or not connected.` }], details: { connected: false }, isError: true };
 				}
 				return { content: [{ type: "text", text: "Not linked. Use /link to connect." }], details: { connected: false } };
+			}
+
+				// Interview mode guard: block interviewees unless force
+			if (link.selfRole === "interviewee" && !params.force) {
+				return {
+					content: [{ type: "text", text: `Cannot send task: you are the ${roleIcon("interviewee")} interviewee. ` +
+						`Tasks flow FROM the ${roleIcon("interviewer")} interviewer TO you. ` +
+						`Use force: true to override.` }],
+					details: { connected: true, role: "interviewee", blocked: true },
+					isError: true,
+				};
 			}
 
 			const taskId = generateId();
