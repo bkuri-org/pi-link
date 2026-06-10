@@ -18,6 +18,7 @@
  *   /link status                          — show connection info
  *   /link list                            — show all links
  *   /link disconnect [id]                 — close a link
+ *   /link purge [--force]                  — remove all inactive links + stale disk state
  *   /link version                         — show version + content hash
  *   /link-task <prompt>                   — send a silent task
  *   /link-task --visible <prompt>         — send a visible task
@@ -34,6 +35,7 @@ import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import {
 	LINKS_DIR,
+	LINK_RECOVERY_DIR,
 	STALE_THRESHOLD_MS,
 	HEARTBEAT_INTERVAL_MS,
 	HEARTBEAT_TIMEOUT_MS,
@@ -1016,9 +1018,9 @@ export default function (pi: ExtensionAPI) {
 	// ─── Commands ──────────────────────────────────────────────────────────
 
 	pi.registerCommand("link", {
-		description: "Manage session links (create, join, status, disconnect, version, list, HTTP remote)",
+		description: "Manage session links (create, join, status, disconnect, purge, version, list, HTTP remote)",
 		getArgumentCompletions: (prefix: string) => {
-			const cmds = ["create", "status", "disconnect", "version", "list"];
+			const cmds = ["create", "status", "disconnect", "version", "list", "purge"];
 			const filtered = cmds.filter((c) => c.startsWith(prefix));
 			return filtered.length > 0 ? filtered.map((c) => ({ value: c, label: c })) : null;
 		},
@@ -1035,12 +1037,13 @@ export default function (pi: ExtensionAPI) {
 				case "disconnect": return cmdDisconnect(rest, c);
 				case "version": return cmdVersion(c);
 				case "list": return cmdList(c);
+				case "purge": return cmdPurge(rest, c);
 				case "": return cmdJoin(c);
 				default:
 					if (sub.startsWith("http://") || sub.startsWith("https://")) {
 						return cmdJoinHttp(sub, c);
 					}
-					c.ui.notify(`Unknown: ${sub}. Use: /link [create|status|disconnect|version|list|http://...]`, "error");
+					c.ui.notify(`Unknown: ${sub}. Use: /link [create|status|disconnect|purge|version|list|http://...]`, "error");
 			}
 		},
 	});
@@ -1339,6 +1342,120 @@ export default function (pi: ExtensionAPI) {
 		if (!link) { c.ui.notify("Not linked", "info"); return; }
 		c.ui.notify("🔗 Disconnected", "info");
 		cleanupLink(link);
+	}
+
+	function cmdPurge(args: string, c: ExtensionContext): void {
+		const force = args.trim() === "--force";
+		const lines: string[] = [];
+		let purgedCount = 0;
+
+		// 1. Disconnect and remove inactive links from memory
+		for (const [id, link] of linksRegistry) {
+			if (force || !link.isConnected) {
+				stopHeartbeatForLink(link);
+				if (link.connection) { link.connection.destroy(); link.connection = undefined; }
+				if (link.server) { link.server.close(); link.server = undefined; }
+				if (link.httpServer) { link.httpServer.close(); link.httpServer = undefined; link.httpPort = undefined; }
+				if (link.meta.sessionId) deleteRecoveryData(link.meta.sessionId);
+				lines.push(`  \u2717 ${link.meta.sessionName} (${link.isConnected ? "active" : "inactive"})${force ? " [forced]" : ""}`);
+				purgedCount++;
+			} else {
+				lines.push(`  \u2713 ${link.meta.sessionName} (active, kept)`);
+			}
+		}
+
+		if (force) {
+			linksRegistry.clear();
+			streamBuffers.clear();
+			state = createInitialState();
+		} else {
+			for (const [id, link] of linksRegistry) {
+				if (!link.isConnected) linksRegistry.delete(id);
+			}
+			if (!linksRegistry.has(state.linkId)) {
+				let next: LinkState | undefined;
+				for (const l of linksRegistry.values()) {
+					if (l.isConnected) { next = l; break; }
+				}
+				state = next ?? createInitialState();
+			}
+		}
+
+		// 2. Purge stale link directories on disk
+		ensureLinksDir();
+		try {
+			const entries = fs.readdirSync(LINKS_DIR, { withFileTypes: true });
+			for (const entry of entries) {
+				if (!entry.isDirectory()) continue;
+				if (entry.name.startsWith("__test_")) continue;
+
+				const dir = path.join(LINKS_DIR, entry.name);
+				const meta = readMeta(dir);
+
+				// Skip active host link directories
+				let isActiveHost = false;
+				if (!force) {
+					for (const link of linksRegistry.values()) {
+						if (link.mode === "host" && link.linkId === entry.name && link.isConnected) {
+							isActiveHost = true;
+							break;
+						}
+					}
+				}
+
+				if (isActiveHost) {
+					lines.push(`  \u2713 ${meta?.sessionName ?? entry.name} (active host dir, kept)`);
+					continue;
+				}
+
+				// Skip our own session's directory (we might be hosting)
+				if (meta?.sessionId === state.meta.sessionId && !force) {
+					lines.push(`  \u2713 ${meta?.sessionName ?? entry.name} (own session, kept)`);
+					continue;
+				}
+
+				cleanupLinkDir(dir);
+				lines.push(`  \U0001F5D1 ${meta?.sessionName ?? entry.name} (disk dir purged)`);
+				purgedCount++;
+			}
+		} catch {
+			// Directory doesn't exist
+		}
+
+		// 3. Purge stale recovery data
+		try {
+			fs.mkdirSync(LINK_RECOVERY_DIR, { recursive: true });
+			const recoveryEntries = fs.readdirSync(LINK_RECOVERY_DIR);
+			for (const entry of recoveryEntries) {
+				if (!entry.endsWith(".json")) continue;
+				const filePath = path.join(LINK_RECOVERY_DIR, entry);
+				try {
+					const raw = fs.readFileSync(filePath, "utf-8");
+					const data = JSON.parse(raw) as LinkRecoveryData;
+					if (force || Date.now() - data.savedAt > STALE_THRESHOLD_MS) {
+						deleteRecoveryData(data.sessionId);
+						lines.push(`  \U0001F5D1 Recovery: ${data.sessionId.slice(0, 8)} (${data.mode})`);
+						purgedCount++;
+					}
+				} catch {
+					try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+					purgedCount++;
+				}
+			}
+		} catch {
+			// No recovery dir
+		}
+
+		stopSpinner();
+		updateWidget();
+
+		if (purgedCount === 0 && lines.length === 0) {
+			c.ui.notify("\U0001F517 No stale links to purge. Everything is clean.", "info");
+		} else {
+			lines.unshift(`\U0001F517 Purge ${force ? "(force)" : "(inactive only)"}:`);
+			lines.push(`\n  ${purgedCount} item(s) purged.`);
+			c.ui.notify(lines.join("\n"), purgedCount > 0 ? "success" : "info");
+		}
 	}
 
 	function cmdVersion(c: ExtensionContext): void {
