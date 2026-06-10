@@ -17,17 +17,40 @@ Three link roles (shown in widget with arrows):
 
 ```
 ~/.pi/agent/extensions/link/
-├── index.ts      — Extension entry point (commands, tools, events, socket handling, UI)
-├── types.ts      — Types, constants, UDS helpers, JSON-RPC framing, link discovery
-└── headless.ts   — Silent subprocess runner (context snapshot + headless pi spawn)
+├── index.ts           — Extension entry point
+├── types.ts           — Types, constants, UDS/JSON-RPC helpers
+├── link-context.ts    — Shared context bag for all modules
+├── commands.ts        — /link and /link-task command handlers
+├── tools.ts           — link_send_task, link_status tool registration
+├── message-handler.ts — Incoming JSON-RPC message routing
+├── headless.ts        — Silent subprocess runner (headless pi spawn)
+├── lifecycle.ts       — Heartbeat, peer lost detection, cleanup
+├── widget.ts          — TUI status widget
+├── activity.ts        — Task activity tracking
+├── http-adapter.ts    — HTTP transport for cross-machine links
+├── recovery.ts        — Link recovery after pi reload
+├── test-link.ts       — Standalone tests for UDS + framing
+└── AGENTS.md          — This file
 ```
+
+## Install Target
+
+| Field | Value |
+|-------|-------|
+| **Repo** | `~/source/org/pi-link/` |
+| **Install dir** | `~/.pi/agent/extensions/link/` |
+| **Extension name** | `link` |
+
+The install dir is intentionally short (`link`, not `pi-link`) to match the user-facing
+command/tool namespace (`/link`, `link_send_task`, `link_status`). The repo and display
+name remain `pi-link`.
 
 ## Build, Lint, and Test Commands
 
 ```bash
 # No build step — pi loads .ts directly via jiti
-# Install: cp -r link/ ~/.pi/agent/extensions/
-# Verify brackets: node -e "const c=require('fs').readFileSync('index.ts','utf-8');let b=0;for(const ch of c){if(ch==='{')b++;if(ch==='}')b--;}console.log(b===0?'balanced':'mismatch')"
+# Install: cp -r ~/source/org/pi-link/ ~/.pi/agent/extensions/link/
+# Verify brackets (all .ts files): for f in *.ts; do node -e "const c=require('fs').readFileSync('$f','utf-8');let b=0;for(const ch of c){if(ch==='{')b++;if(ch==='}')b--;}console.log('$f: '+(b===0?'balanced':'MISMATCH'))"; done
 
 # Test UDS + framing logic:
 npx -y tsx test-link.ts
@@ -60,9 +83,11 @@ rm -f /tmp/jiti/extensions-link.*
 
 | Command | Description |
 |---------|-------------|
-| `/link` | Auto-join or create a symmetric link |
-| `/link interview [name]` | Create an interview-mode link (🎤 → interviewee) |
-| `/link create [--interview] [--http [port]]` | Create a link with options |
+| `/link` | Smart: join existing link, or create new if none found |
+| `/link new [name] [--interview] [--http [port]]` | Create a new link |
+| `/link join` | Discover and join an existing link |
+| `/link interview [name]` | Join as interviewer (🎤 → interviewee) |
+| `/link http://host:port` | Connect to remote link via HTTP |
 | `/link role` | Show current role |
 | `/link role reverse` | Swap interviewer/interviewee roles |
 | `/link role symmetric` | Disable interview mode, revert to 🔗 ↔ |
@@ -77,13 +102,28 @@ rm -f /tmp/jiti/extensions-link.*
 
 ## Project Structure
 
+See the **Architecture** tree above for the authoritative file listing.
+
 ```
 pi-link-extension/
-├── index.ts        # Commands, tools, events, socket handling, UI widgets
-├── types.ts        # LinkMeta, LinkRole, JsonRpcMessage, LinkState, discovery, UDS helpers
-├── headless.ts     # Context snapshot + headless pi subprocess spawning
-├── DESIGN.md       # Architecture doc with A2A/ACP protocol mapping
-└── test-link.ts    # Standalone tests for UDS + framing (23 tests)
+├── index.ts            # Extension entry point (init wiring, events)
+├── types.ts            # Core types, constants, UDS/JSON-RPC helpers
+├── link-context.ts     # Shared context bag for all modules
+├── commands.ts         # /link and /link-task command handlers
+├── tools.ts            # link_send_task, link_status tool registration
+├── message-handler.ts  # Incoming JSON-RPC message routing
+├── headless.ts         # Context snapshot + headless pi subprocess
+├── lifecycle.ts        # Heartbeat, peer lost detection, cleanup
+├── widget.ts           # TUI status widget
+├── activity.ts         # Task activity tracking
+├── http-adapter.ts     # HTTP transport for cross-machine links
+├── recovery.ts         # Link recovery after pi reload
+├── DESIGN.md           # Architecture doc with A2A/ACP protocol mapping
+├── test-link.ts        # Standalone tests for UDS + framing
+├── test-helpers.ts     # Shared test utilities
+├── test-http-adapter.ts # HTTP adapter tests
+├── test-multi-link.ts  # Multi-link tests
+└── test-streaming.ts   # Streaming task tests
 ```
 
 ## Constraints
