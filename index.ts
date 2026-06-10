@@ -1357,10 +1357,10 @@ export default function (pi: ExtensionAPI) {
 				if (link.server) { link.server.close(); link.server = undefined; }
 				if (link.httpServer) { link.httpServer.close(); link.httpServer = undefined; link.httpPort = undefined; }
 				if (link.meta.sessionId) deleteRecoveryData(link.meta.sessionId);
-				lines.push(`  \u2717 ${link.meta.sessionName} (${link.isConnected ? "active" : "inactive"})${force ? " [forced]" : ""}`);
+				lines.push(`  ✗ ${link.meta.sessionName} (${link.isConnected ? "active" : "inactive"})${force ? " [forced]" : ""}`);
 				purgedCount++;
 			} else {
-				lines.push(`  \u2713 ${link.meta.sessionName} (active, kept)`);
+				lines.push(`  ✓ ${link.meta.sessionName} (active, kept)`);
 			}
 		}
 
@@ -1404,18 +1404,18 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (isActiveHost) {
-					lines.push(`  \u2713 ${meta?.sessionName ?? entry.name} (active host dir, kept)`);
+					lines.push(`  ✓ ${meta?.sessionName ?? entry.name} (active host dir, kept)`);
 					continue;
 				}
 
 				// Skip our own session's directory (we might be hosting)
 				if (meta?.sessionId === state.meta.sessionId && !force) {
-					lines.push(`  \u2713 ${meta?.sessionName ?? entry.name} (own session, kept)`);
+					lines.push(`  ✓ ${meta?.sessionName ?? entry.name} (own session, kept)`);
 					continue;
 				}
 
 				cleanupLinkDir(dir);
-				lines.push(`  \U0001F5D1 ${meta?.sessionName ?? entry.name} (disk dir purged)`);
+				lines.push(`  🗑 ${meta?.sessionName ?? entry.name} (disk dir purged)`);
 				purgedCount++;
 			}
 		} catch {
@@ -1434,7 +1434,7 @@ export default function (pi: ExtensionAPI) {
 					const data = JSON.parse(raw) as LinkRecoveryData;
 					if (force || Date.now() - data.savedAt > STALE_THRESHOLD_MS) {
 						deleteRecoveryData(data.sessionId);
-						lines.push(`  \U0001F5D1 Recovery: ${data.sessionId.slice(0, 8)} (${data.mode})`);
+						lines.push(`  🗑 Recovery: ${data.sessionId.slice(0, 8)} (${data.mode})`);
 						purgedCount++;
 					}
 				} catch {
@@ -1450,9 +1450,9 @@ export default function (pi: ExtensionAPI) {
 		updateWidget();
 
 		if (purgedCount === 0 && lines.length === 0) {
-			c.ui.notify("\U0001F517 No stale links to purge. Everything is clean.", "info");
+			c.ui.notify("🔗 No stale links to purge. Everything is clean.", "info");
 		} else {
-			lines.unshift(`\U0001F517 Purge ${force ? "(force)" : "(inactive only)"}:`);
+			lines.unshift(`🔗 Purge ${force ? "(force)" : "(inactive only)"}:`);
 			lines.push(`\n  ${purgedCount} item(s) purged.`);
 			c.ui.notify(lines.join("\n"), purgedCount > 0 ? "success" : "info");
 		}
